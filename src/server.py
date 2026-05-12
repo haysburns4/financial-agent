@@ -1,4 +1,4 @@
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -6,8 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from src.config import settings
 from src.db import get_connection, health_check
 from src.etrade.auth import auth
-from src.models import Indicator, PipelineRun, PriceBar, Signal
-from src.scheduler import price_pipeline
+from src.models import Indicator, PipelineRun, Position, PriceBar, Signal
+from src.scheduler import portfolio_pipeline, price_pipeline
+from src.signals.engine import SIGNAL_CATEGORIES, signal_types_for_category
 
 
 class CompleteAuthBody(BaseModel):
@@ -124,16 +125,31 @@ def create_app() -> FastAPI:
 
     @app.get("/signals")
     async def recent_signals(
+        ticker: str | None = None,
+        type: str | None = Query(default=None, description="entry | exit | risk"),
         limit: int = 50,
         conn: AsyncConnection = Depends(_conn_dep),
     ):
-        stmt = select(Signal).order_by(Signal.created_at.desc()).limit(limit)
+        stmt = select(Signal).order_by(Signal.created_at.desc())
+        if ticker:
+            stmt = stmt.where(Signal.ticker == ticker.strip().upper())
+        if type:
+            allowed = signal_types_for_category(type)
+            if not allowed:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"type must be one of: {sorted(set(SIGNAL_CATEGORIES.values()))}",
+                )
+            stmt = stmt.where(Signal.signal_type.in_(allowed))
+        stmt = stmt.limit(limit)
         rows = (await conn.execute(stmt)).all()
         return [
             {
+                "id": r.id,
                 "ticker": r.ticker,
                 "timestamp": r.timestamp.isoformat(),
                 "signal_type": r.signal_type,
+                "category": SIGNAL_CATEGORIES.get(r.signal_type),
                 "direction": r.direction,
                 "confidence": r.confidence,
                 "reasoning": r.reasoning,
@@ -142,9 +158,105 @@ def create_app() -> FastAPI:
             for r in rows
         ]
 
+    @app.get("/portfolio")
+    async def list_positions(
+        account_id: str | None = None,
+        conn: AsyncConnection = Depends(_conn_dep),
+    ):
+        stmt = select(Position).order_by(Position.market_value.desc())
+        if account_id is not None:
+            stmt = stmt.where(Position.account_id == account_id)
+        rows = (await conn.execute(stmt)).all()
+        positions = [_position_dict(r) for r in rows]
+
+        if account_id is not None:
+            return positions
+
+        grouped: dict[str, dict] = {}
+        for p in positions:
+            bucket = grouped.setdefault(
+                p["account_id"],
+                {"positions": [], "position_count": 0, "total_market_value": 0.0},
+            )
+            bucket["positions"].append(p)
+            bucket["position_count"] += 1
+            bucket["total_market_value"] += p["market_value"]
+        return dict(sorted(grouped.items()))
+
+    @app.get("/portfolio/risk")
+    async def portfolio_risk(conn: AsyncConnection = Depends(_conn_dep)):
+        stmt = select(Position)
+        rows = (await conn.execute(stmt)).all()
+        if not rows:
+            return {"combined": _risk_for([]), "by_account": {}}
+
+        by_account: dict[str, list] = {}
+        for r in rows:
+            by_account.setdefault(r.account_id, []).append(r)
+
+        return {
+            "combined": _risk_for(rows),
+            "by_account": {acct: _risk_for(positions) for acct, positions in sorted(by_account.items())},
+        }
+
+    @app.post("/pipeline/portfolio/run")
+    async def trigger_portfolio_run():
+        if not auth.is_authenticated():
+            raise HTTPException(status_code=401, detail="E-Trade not authenticated")
+        result = await portfolio_pipeline.run()
+        return {
+            "status": result.status,
+            "started_at": result.started_at.isoformat(),
+            "completed_at": result.completed_at.isoformat(),
+            "accounts_processed": result.accounts_processed,
+            "positions_stored": result.positions_stored,
+            "accounts": result.accounts,
+            "errors": result.errors,
+        }
+
     return app
 
 
 async def _conn_dep():
     async with get_connection() as conn:
         yield conn
+
+
+def _position_dict(r) -> dict:
+    pnl = r.market_value - r.cost_basis
+    return {
+        "account_id": r.account_id,
+        "ticker": r.ticker,
+        "quantity": r.quantity,
+        "cost_basis": r.cost_basis,
+        "market_value": r.market_value,
+        "pnl": pnl,
+        "pnl_pct": (pnl / r.cost_basis) if r.cost_basis else None,
+        "last_updated": r.last_updated.isoformat(),
+    }
+
+
+def _risk_for(positions: list) -> dict:
+    """Risk metrics for an arbitrary set of positions (one account or combined)."""
+    total_exposure = sum(p.market_value for p in positions)
+    total_cost = sum(p.cost_basis for p in positions)
+    concentration = sorted(
+        (
+            {
+                "ticker": p.ticker,
+                "market_value": p.market_value,
+                "pct_of_portfolio": (p.market_value / total_exposure) if total_exposure else 0.0,
+            }
+            for p in positions
+        ),
+        key=lambda x: x["pct_of_portfolio"],
+        reverse=True,
+    )
+    # Proxy for true peak-to-trough drawdown until we persist portfolio snapshots.
+    drawdown = (total_cost - total_exposure) / total_cost if total_cost > 0 else None
+    return {
+        "total_exposure": total_exposure,
+        "concentration": concentration,
+        "drawdown": drawdown,
+        "position_count": len(positions),
+    }

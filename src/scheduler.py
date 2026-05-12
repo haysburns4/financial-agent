@@ -1,4 +1,4 @@
-"""APScheduler wiring for the price pipeline."""
+"""APScheduler wiring for the price + portfolio pipelines and signal alerting."""
 import asyncio
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
@@ -7,11 +7,15 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
+from src.alerts.discord import deliver_pending_signals
 from src.config import settings
 from src.db import engine
+from src.etrade.accounts import ETradeAccountClient
 from src.etrade.auth import auth
 from src.etrade.market import ETradeMarketClient
+from src.pipelines.portfolio_pipeline import PortfolioPipeline
 from src.pipelines.price_pipeline import PricePipeline
+from src.signals.engine import SignalEngine
 
 
 _NYSE_TZ = ZoneInfo("America/New_York")
@@ -31,11 +35,21 @@ def market_is_open(now: datetime | None = None) -> bool:
     return _MARKET_OPEN <= moment.time() < _MARKET_CLOSE
 
 
-# Singletons that survive across scheduler firings so circuit-breaker state
-# accumulates correctly and so the manual /pipeline/price/run endpoint shares
-# them with the scheduler.
+# Singletons shared between the scheduler and the FastAPI endpoints so that
+# circuit-breaker state accumulates consistently.
 market_client = ETradeMarketClient(auth)
+account_client = ETradeAccountClient(auth)
 price_pipeline = PricePipeline(market_client, engine)
+portfolio_pipeline = PortfolioPipeline(account_client, engine)
+signal_engine = SignalEngine(engine)
+
+
+async def _price_then_signals() -> None:
+    await price_pipeline.run(settings.WATCHLIST)
+    await signal_engine.run_all(settings.WATCHLIST)
+    sent = await deliver_pending_signals()
+    if sent:
+        logger.info("Discord delivered {} signal(s)", sent)
 
 
 def _price_job() -> None:
@@ -47,9 +61,20 @@ def _price_job() -> None:
         return
     logger.info("price_pipeline firing for {} tickers", len(settings.WATCHLIST))
     try:
-        asyncio.run(price_pipeline.run(settings.WATCHLIST))
+        asyncio.run(_price_then_signals())
     except Exception:
-        logger.exception("price_pipeline run raised")
+        logger.exception("price_pipeline chain raised")
+
+
+def _portfolio_job() -> None:
+    if not auth.is_authenticated():
+        logger.warning("portfolio_pipeline skipped: E-Trade not authenticated")
+        return
+    logger.info("portfolio_pipeline firing")
+    try:
+        asyncio.run(portfolio_pipeline.run())
+    except Exception:
+        logger.exception("portfolio_pipeline raised")
 
 
 def build_scheduler() -> BackgroundScheduler:
@@ -59,6 +84,15 @@ def build_scheduler() -> BackgroundScheduler:
         trigger=IntervalTrigger(minutes=settings.PRICE_POLL_MINUTES),
         id="price_pipeline",
         name="price_pipeline",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+    scheduler.add_job(
+        _portfolio_job,
+        trigger=IntervalTrigger(minutes=settings.PORTFOLIO_POLL_MINUTES),
+        id="portfolio_pipeline",
+        name="portfolio_pipeline",
         max_instances=1,
         coalesce=True,
         misfire_grace_time=60,
