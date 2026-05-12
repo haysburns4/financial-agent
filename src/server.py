@@ -1,9 +1,15 @@
 from fastapi import Depends, FastAPI
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from src.db import get_connection, health_check
+from src.etrade.auth import auth
 from src.models import PriceBar, Signal
+
+
+class CompleteAuthBody(BaseModel):
+    verifier: str
 
 
 def create_app() -> FastAPI:
@@ -13,6 +19,23 @@ def create_app() -> FastAPI:
     async def health():
         ok = await health_check()
         return {"status": "ok" if ok else "degraded", "db": ok}
+
+    @app.post("/auth/start")
+    async def auth_start():
+        url = auth.start_auth()
+        return {"auth_url": url}
+
+    @app.post("/auth/complete")
+    async def auth_complete(body: CompleteAuthBody):
+        auth.complete_auth(body.verifier)
+        return {"authenticated": True}
+
+    @app.get("/auth/status")
+    async def auth_status():
+        return {
+            "authenticated": auth.is_authenticated(),
+            "session_age_minutes": auth.session_age_minutes(),
+        }
 
     @app.get("/prices/{ticker}")
     async def latest_prices(

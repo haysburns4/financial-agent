@@ -1,68 +1,107 @@
-"""E-Trade market data wrapper.
+"""E-Trade market data client.
 
-`pyetrade` is a synchronous library; we run its calls in a worker thread so
-the asyncio scheduler isn't blocked.
+`pyetrade` is synchronous; we run its calls in a worker thread so the asyncio
+event loop isn't blocked. Network-level failures are retried via tenacity.
 """
 import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-import pyetrade
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
-from src.config import settings
-from src.etrade.auth import current_tokens, is_sandbox
-
-
-def _market_client() -> pyetrade.ETradeMarket:
-    tokens = current_tokens()
-    return pyetrade.ETradeMarket(
-        settings.ETRADE_CONSUMER_KEY,
-        settings.ETRADE_CONSUMER_SECRET,
-        tokens.oauth_token,
-        tokens.oauth_token_secret,
-        dev=is_sandbox(),
-    )
+from src.etrade.auth import ETradeAuth
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-def _get_quote_sync(ticker: str) -> dict[str, Any]:
-    return _market_client().get_quote([ticker], resp_format="json")
-
-
-async def fetch_ohlcv(ticker: str) -> list[dict[str, Any]]:
-    """Return a list of OHLCV bar dicts ready to feed into `PriceBarIn`.
-
-    E-Trade's quote endpoint returns a single snapshot, not a series. For now
-    we materialize a one-bar series from that snapshot; swap this out for the
-    historical-bars endpoint when ready.
-    """
+def _to_float(value: Any, default: float = 0.0) -> float:
     try:
-        payload = await asyncio.to_thread(_get_quote_sync, ticker)
-    except Exception:
-        logger.exception("E-Trade quote failed for {}", ticker)
-        return []
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-    quotes = (
-        payload.get("QuoteResponse", {}).get("QuoteData", [])
-        if isinstance(payload, dict)
-        else []
-    )
-    bars: list[dict[str, Any]] = []
-    for q in quotes:
-        all_data = q.get("All", {}) if isinstance(q, dict) else {}
-        bars.append(
-            {
-                "ticker": ticker,
-                "timestamp": datetime.now(timezone.utc),
-                "open": float(all_data.get("open", 0.0)),
-                "high": float(all_data.get("high", 0.0)),
-                "low": float(all_data.get("low", 0.0)),
-                "close": float(all_data.get("lastTrade", 0.0)),
-                "volume": float(all_data.get("totalVolume", 0.0)),
-                "adjusted_close": float(all_data.get("lastTrade", 0.0)),
-                "data_quality": "ok",
-            }
+
+class ETradeMarketClient:
+    def __init__(self, auth: ETradeAuth) -> None:
+        self._auth = auth
+
+    async def get_quotes(self, tickers: list[str]) -> list[dict]:
+        if not tickers:
+            return []
+        try:
+            payload = await asyncio.to_thread(self._get_quotes_sync, tickers)
+        except Exception:
+            logger.exception("E-Trade get_quotes failed for {}", tickers)
+            return []
+
+        quote_data = (
+            payload.get("QuoteResponse", {}).get("QuoteData", [])
+            if isinstance(payload, dict)
+            else []
         )
-    return bars
+        if isinstance(quote_data, dict):
+            quote_data = [quote_data]
+
+        now = datetime.now(timezone.utc)
+        results: list[dict] = []
+        for q in quote_data:
+            if not isinstance(q, dict):
+                continue
+
+            messages = q.get("Messages", {}) or {}
+            msg_list = messages.get("Message", []) if isinstance(messages, dict) else []
+            if isinstance(msg_list, dict):
+                msg_list = [msg_list]
+            error_msgs = [
+                m for m in msg_list
+                if isinstance(m, dict) and str(m.get("type", "")).upper() in ("WARNING", "ERROR")
+            ]
+            if error_msgs:
+                logger.warning(
+                    "E-Trade quote returned messages for {}: {}",
+                    q.get("Product", {}).get("symbol"),
+                    error_msgs,
+                )
+
+            all_data = q.get("All")
+            if not isinstance(all_data, dict):
+                logger.warning(
+                    "E-Trade quote missing 'All' block for {}; skipping",
+                    q.get("Product", {}).get("symbol"),
+                )
+                continue
+
+            ticker = q.get("Product", {}).get("symbol") if isinstance(q.get("Product"), dict) else None
+            if not ticker:
+                logger.warning("E-Trade quote missing symbol; skipping entry")
+                continue
+
+            results.append(
+                {
+                    "ticker": ticker,
+                    "last": _to_float(all_data.get("lastTrade")),
+                    "bid": _to_float(all_data.get("bid")),
+                    "ask": _to_float(all_data.get("ask")),
+                    "high": _to_float(all_data.get("high")),
+                    "low": _to_float(all_data.get("low")),
+                    "open": _to_float(all_data.get("open")),
+                    "close": _to_float(all_data.get("previousClose")),
+                    "volume": _to_float(all_data.get("totalVolume")),
+                    "timestamp": now,
+                }
+            )
+
+        return results
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        reraise=True,
+    )
+    def _get_quotes_sync(self, tickers: list[str]) -> dict:
+        return self._auth.get_market_session().get_quote(tickers, resp_format="json")

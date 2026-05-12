@@ -1,103 +1,156 @@
-"""E-Trade accounts wrapper — account list, balances, positions."""
+"""E-Trade accounts client — account list, positions, balances."""
 import asyncio
-from datetime import datetime, timezone
 from typing import Any
 
-import pyetrade
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
-from src.config import settings
-from src.etrade.auth import current_tokens, is_sandbox
-
-
-def _accounts_client() -> pyetrade.ETradeAccounts:
-    tokens = current_tokens()
-    return pyetrade.ETradeAccounts(
-        settings.ETRADE_CONSUMER_KEY,
-        settings.ETRADE_CONSUMER_SECRET,
-        tokens.oauth_token,
-        tokens.oauth_token_secret,
-        dev=is_sandbox(),
-    )
+from src.etrade.auth import ETradeAuth
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-def _list_accounts_sync() -> dict[str, Any]:
-    return _accounts_client().list_accounts(resp_format="json")
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-def _get_portfolio_sync(account_id_key: str) -> dict[str, Any]:
-    return _accounts_client().get_account_portfolio(account_id_key, resp_format="json")
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-def _get_balance_sync(account_id_key: str) -> dict[str, Any]:
-    return _accounts_client().get_account_balance(account_id_key, resp_format="json")
-
-
-async def list_accounts() -> list[dict[str, Any]]:
+def _to_float(value: Any, default: float = 0.0) -> float:
     try:
-        payload = await asyncio.to_thread(_list_accounts_sync)
-    except Exception:
-        logger.exception("E-Trade list_accounts failed")
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_list(value: Any) -> list:
+    if value is None:
         return []
-
-    accounts = (
-        payload.get("AccountListResponse", {})
-        .get("Accounts", {})
-        .get("Account", [])
-        if isinstance(payload, dict)
-        else []
-    )
-    return accounts if isinstance(accounts, list) else [accounts]
+    if isinstance(value, list):
+        return value
+    return [value]
 
 
-async def fetch_positions() -> list[dict[str, Any]]:
-    """Return a flat list of position dicts ready to feed into `PositionIn`."""
-    out: list[dict[str, Any]] = []
-    accounts = await list_accounts()
+class ETradeAccountClient:
+    def __init__(self, auth: ETradeAuth) -> None:
+        self._auth = auth
 
-    for account in accounts:
-        account_id = str(account.get("accountId", ""))
-        account_id_key = account.get("accountIdKey")
-        if not account_id_key:
-            continue
-
+    async def list_accounts(self) -> list[dict]:
         try:
-            payload = await asyncio.to_thread(_get_portfolio_sync, account_id_key)
+            payload = await asyncio.to_thread(self._list_accounts_sync)
         except Exception:
-            logger.exception("E-Trade get_account_portfolio failed for {}", account_id)
-            continue
+            logger.exception("E-Trade list_accounts failed")
+            return []
+
+        accounts = (
+            payload.get("AccountListResponse", {}).get("Accounts", {}).get("Account", [])
+            if isinstance(payload, dict)
+            else []
+        )
+        accounts = _as_list(accounts)
+
+        out: list[dict] = []
+        for a in accounts:
+            if not isinstance(a, dict):
+                continue
+            out.append(
+                {
+                    "account_id": str(a.get("accountId", "")),
+                    "account_id_key": a.get("accountIdKey"),
+                    "description": a.get("accountDesc") or a.get("institutionType") or "",
+                }
+            )
+        return out
+
+    async def get_positions(self, account_id: str) -> list[dict]:
+        try:
+            payload = await asyncio.to_thread(self._get_portfolio_sync, account_id)
+        except Exception:
+            logger.exception("E-Trade get_positions failed for {}", account_id)
+            return []
 
         portfolios = (
             payload.get("PortfolioResponse", {}).get("AccountPortfolio", [])
             if isinstance(payload, dict)
             else []
         )
-        if isinstance(portfolios, dict):
-            portfolios = [portfolios]
+        portfolios = _as_list(portfolios)
 
-        now = datetime.now(timezone.utc)
+        out: list[dict] = []
         for portfolio in portfolios:
-            positions = portfolio.get("Position", [])
-            if isinstance(positions, dict):
-                positions = [positions]
-            for p in positions:
-                product = p.get("Product", {}) if isinstance(p, dict) else {}
-                ticker = product.get("symbol")
-                if not ticker:
+            if not isinstance(portfolio, dict):
+                continue
+            for p in _as_list(portfolio.get("Position")):
+                if not isinstance(p, dict):
                     continue
-                out.append(
-                    {
-                        "account_id": account_id,
-                        "ticker": ticker,
-                        "quantity": float(p.get("quantity", 0.0)),
-                        "cost_basis": float(p.get("costPerShare", 0.0)) * float(p.get("quantity", 0.0)),
-                        "market_value": float(p.get("marketValue", 0.0)),
-                        "last_updated": now,
-                    }
-                )
+                try:
+                    product = p.get("Product") if isinstance(p.get("Product"), dict) else {}
+                    ticker = product.get("symbol")
+                    if not ticker:
+                        logger.warning("E-Trade position missing symbol; skipping")
+                        continue
+                    quantity = _to_float(p.get("quantity"))
+                    out.append(
+                        {
+                            "ticker": ticker,
+                            "quantity": quantity,
+                            "costBasis": _to_float(p.get("costPerShare")) * quantity,
+                            "marketValue": _to_float(p.get("marketValue")),
+                            "pctGain": _to_float(p.get("totalGainPct")),
+                        }
+                    )
+                except Exception:
+                    logger.exception("E-Trade position parse failed; skipping entry")
+                    continue
 
-    return out
+        return out
+
+    async def get_balance(self, account_id: str) -> dict:
+        try:
+            payload = await asyncio.to_thread(self._get_balance_sync, account_id)
+        except Exception:
+            logger.exception("E-Trade get_balance failed for {}", account_id)
+            return {"cash_balance": 0.0, "total_market_value": 0.0, "day_gain_loss": 0.0}
+
+        computed = (
+            payload.get("BalanceResponse", {}).get("Computed", {})
+            if isinstance(payload, dict)
+            else {}
+        )
+        if not isinstance(computed, dict):
+            computed = {}
+        real_time = computed.get("RealTimeValues") if isinstance(computed.get("RealTimeValues"), dict) else {}
+
+        return {
+            "cash_balance": _to_float(computed.get("cashAvailableForInvestment")),
+            "total_market_value": _to_float(real_time.get("totalAccountValue")),
+            "day_gain_loss": _to_float(real_time.get("totalDayGainLoss")),
+        }
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        reraise=True,
+    )
+    def _list_accounts_sync(self) -> dict:
+        return self._auth.get_accounts_session().list_accounts(resp_format="json")
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        reraise=True,
+    )
+    def _get_portfolio_sync(self, account_id_key: str) -> dict:
+        return self._auth.get_accounts_session().get_account_portfolio(
+            account_id_key, resp_format="json"
+        )
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        reraise=True,
+    )
+    def _get_balance_sync(self, account_id_key: str) -> dict:
+        return self._auth.get_accounts_session().get_account_balance(
+            account_id_key, resp_format="json"
+        )
