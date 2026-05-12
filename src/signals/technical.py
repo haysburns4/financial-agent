@@ -33,21 +33,36 @@ async def load_price_frame(conn: AsyncConnection, ticker: str, limit: int = 200)
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a frame with rsi_14, macd_*, ema_9, ema_21 columns."""
+    """Return a frame with rsi_14, macd_*, ema_9, ema_21 columns.
+
+    MACD requires at least 26 rows; below that we return NaN for MACD fields
+    (RSI and EMAs degrade naturally via pandas-ta's internal NaN padding).
+    """
     if df.empty:
-        return df
+        return df.copy()
 
     out = df.copy()
-    out["rsi_14"] = ta.rsi(out["close"], length=14)
+    n = len(out)
 
-    macd = ta.macd(out["close"], fast=12, slow=26, signal=9)
-    if macd is not None and not macd.empty:
-        out["macd_line"] = macd.iloc[:, 0]
-        out["macd_signal"] = macd.iloc[:, 2]
-        out["macd_hist"] = macd.iloc[:, 1]
+    out["rsi_14"] = ta.rsi(out["close"], length=14) if n >= 14 else float("nan")
 
-    out["ema_9"] = ta.ema(out["close"], length=9)
-    out["ema_21"] = ta.ema(out["close"], length=21)
+    if n >= 26:
+        macd = ta.macd(out["close"], fast=12, slow=26, signal=9)
+        if macd is not None and not macd.empty:
+            out["macd_line"] = macd["MACD_12_26_9"]
+            out["macd_signal"] = macd["MACDs_12_26_9"]
+            out["macd_hist"] = macd["MACDh_12_26_9"]
+        else:
+            out["macd_line"] = float("nan")
+            out["macd_signal"] = float("nan")
+            out["macd_hist"] = float("nan")
+    else:
+        out["macd_line"] = float("nan")
+        out["macd_signal"] = float("nan")
+        out["macd_hist"] = float("nan")
+
+    out["ema_9"] = ta.ema(out["close"], length=9) if n >= 9 else float("nan")
+    out["ema_21"] = ta.ema(out["close"], length=21) if n >= 21 else float("nan")
     return out
 
 
