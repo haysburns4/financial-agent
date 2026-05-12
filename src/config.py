@@ -1,5 +1,7 @@
+from typing import Annotated
+
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -16,7 +18,9 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "sqlite+aiosqlite:///data/agent.db"
 
-    WATCHLIST: list[str] = Field(default_factory=lambda: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"])
+    WATCHLIST: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
+    )
 
     PRICE_POLL_MINUTES: int = 5
     PORTFOLIO_POLL_MINUTES: int = 15
