@@ -30,19 +30,24 @@ def create_app() -> FastAPI:
 
     @app.post("/auth/complete")
     async def auth_complete(body: CompleteAuthBody):
-        auth.complete_auth(body.verifier)
+        await auth.complete_auth(body.verifier)
         return {"authenticated": True}
+
+    @app.post("/auth/logout")
+    async def auth_logout():
+        await auth.clear_persisted()
+        return {"authenticated": False}
 
     @app.get("/auth/status")
     async def auth_status():
         return {
-            "authenticated": auth.is_authenticated(),
+            "authenticated": await auth.is_authenticated(),
             "session_age_minutes": auth.session_age_minutes(),
         }
 
     @app.post("/pipeline/price/run")
     async def trigger_price_run(tickers: str | None = None):
-        if not auth.is_authenticated():
+        if not await auth.is_authenticated():
             raise HTTPException(status_code=401, detail="E-Trade not authenticated")
         if tickers:
             ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
@@ -206,7 +211,7 @@ def create_app() -> FastAPI:
 
     @app.post("/pipeline/portfolio/run")
     async def trigger_portfolio_run():
-        if not auth.is_authenticated():
+        if not await auth.is_authenticated():
             raise HTTPException(status_code=401, detail="E-Trade not authenticated")
         result = await portfolio_pipeline.run()
         return {

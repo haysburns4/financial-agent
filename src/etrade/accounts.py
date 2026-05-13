@@ -34,7 +34,8 @@ class ETradeAccountClient:
 
     async def list_accounts(self) -> list[dict]:
         try:
-            payload = await asyncio.to_thread(self._list_accounts_sync)
+            session = await self._auth.get_accounts_session()
+            payload = await asyncio.to_thread(self._list_accounts_sync, session)
         except Exception:
             logger.exception("E-Trade list_accounts failed")
             return []
@@ -61,7 +62,8 @@ class ETradeAccountClient:
 
     async def get_positions(self, account_id: str) -> list[dict]:
         try:
-            payload = await asyncio.to_thread(self._get_portfolio_sync, account_id)
+            session = await self._auth.get_accounts_session()
+            payload = await asyncio.to_thread(self._get_portfolio_sync, session, account_id)
         except Exception:
             logger.exception("E-Trade get_positions failed for {}", account_id)
             return []
@@ -104,7 +106,8 @@ class ETradeAccountClient:
 
     async def get_balance(self, account_id: str) -> dict:
         try:
-            payload = await asyncio.to_thread(self._get_balance_sync, account_id)
+            session = await self._auth.get_accounts_session()
+            payload = await asyncio.to_thread(self._get_balance_sync, session, account_id)
         except Exception:
             logger.exception("E-Trade get_balance failed for {}", account_id)
             return {"cash_balance": 0.0, "total_market_value": 0.0, "day_gain_loss": 0.0}
@@ -130,8 +133,8 @@ class ETradeAccountClient:
         retry=retry_if_exception_type((ConnectionError, TimeoutError)),
         reraise=True,
     )
-    def _list_accounts_sync(self) -> dict:
-        return self._auth.get_accounts_session().list_accounts(resp_format="json")
+    def _list_accounts_sync(self, session) -> dict:
+        return session.list_accounts(resp_format="json")
 
     @retry(
         stop=stop_after_attempt(3),
@@ -139,10 +142,8 @@ class ETradeAccountClient:
         retry=retry_if_exception_type((ConnectionError, TimeoutError)),
         reraise=True,
     )
-    def _get_portfolio_sync(self, account_id_key: str) -> dict:
-        return self._auth.get_accounts_session().get_account_portfolio(
-            account_id_key, resp_format="json"
-        )
+    def _get_portfolio_sync(self, session, account_id_key: str) -> dict:
+        return session.get_account_portfolio(account_id_key, resp_format="json")
 
     @retry(
         stop=stop_after_attempt(3),
@@ -150,7 +151,5 @@ class ETradeAccountClient:
         retry=retry_if_exception_type((ConnectionError, TimeoutError)),
         reraise=True,
     )
-    def _get_balance_sync(self, account_id_key: str) -> dict:
-        return self._auth.get_accounts_session().get_account_balance(
-            account_id_key, resp_format="json"
-        )
+    def _get_balance_sync(self, session, account_id_key: str) -> dict:
+        return session.get_account_balance(account_id_key, resp_format="json")

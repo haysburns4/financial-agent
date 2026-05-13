@@ -33,7 +33,8 @@ class ETradeMarketClient:
         if not tickers:
             return []
         try:
-            payload = await asyncio.to_thread(self._get_quotes_sync, tickers)
+            session = await self._auth.get_market_session()
+            payload = await asyncio.to_thread(self._get_quotes_sync, session, tickers)
         except Exception:
             logger.exception("E-Trade get_quotes failed for {}", tickers)
             return []
@@ -103,5 +104,5 @@ class ETradeMarketClient:
         retry=retry_if_exception_type((ConnectionError, TimeoutError)),
         reraise=True,
     )
-    def _get_quotes_sync(self, tickers: list[str]) -> dict:
-        return self._auth.get_market_session().get_quote(tickers, resp_format="json")
+    def _get_quotes_sync(self, session, tickers: list[str]) -> dict:
+        return session.get_quote(tickers, resp_format="json")

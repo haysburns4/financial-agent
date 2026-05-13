@@ -6,6 +6,7 @@ from loguru import logger
 
 from src.config import settings
 from src.db import engine, init_db
+from src.etrade.auth import auth
 from src.scheduler import build_scheduler
 from src.server import create_app
 
@@ -19,6 +20,11 @@ def _configure_logging() -> None:
 async def lifespan(app):
     _configure_logging()
     await init_db()
+
+    if await auth.load_persisted():
+        logger.info("E-Trade tokens loaded from disk; auth restored")
+    else:
+        logger.info("No persisted E-Trade tokens; OAuth flow required")
 
     scheduler = build_scheduler()
     scheduler.start()

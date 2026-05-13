@@ -46,6 +46,9 @@ signal_engine = SignalEngine(engine)
 
 
 async def _price_then_signals() -> None:
+    if not await auth.is_authenticated():
+        logger.warning("price_pipeline skipped: E-Trade not authenticated")
+        return
     tickers = await monitored_tickers(engine)
     logger.info("price_pipeline firing for {} ticker(s): {}", len(tickers), tickers)
     await price_pipeline.run(tickers)
@@ -59,22 +62,23 @@ def _price_job() -> None:
     if not market_is_open():
         logger.info("price_pipeline skipped: market closed")
         return
-    if not auth.is_authenticated():
-        logger.warning("price_pipeline skipped: E-Trade not authenticated")
-        return
     try:
         asyncio.run(_price_then_signals())
     except Exception:
         logger.exception("price_pipeline chain raised")
 
 
-def _portfolio_job() -> None:
-    if not auth.is_authenticated():
+async def _portfolio_run() -> None:
+    if not await auth.is_authenticated():
         logger.warning("portfolio_pipeline skipped: E-Trade not authenticated")
         return
     logger.info("portfolio_pipeline firing")
+    await portfolio_pipeline.run()
+
+
+def _portfolio_job() -> None:
     try:
-        asyncio.run(portfolio_pipeline.run())
+        asyncio.run(_portfolio_run())
     except Exception:
         logger.exception("portfolio_pipeline raised")
 

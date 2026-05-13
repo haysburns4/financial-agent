@@ -4,6 +4,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -100,3 +101,17 @@ class PipelineRun(Base):
     status: Mapped[str] = mapped_column(String(20))
     tickers_processed: Mapped[int] = mapped_column(default=0)
     errors: Mapped[str | None] = mapped_column(Text)
+
+
+class ETradeCredentials(Base):
+    __tablename__ = "etrade_credentials"
+
+    id: Mapped[int] = mapped_column(primary_key=True)  # always 1 (singleton row)
+    oauth_token_ct: Mapped[bytes] = mapped_column(LargeBinary)
+    oauth_token_secret_ct: Mapped[bytes] = mapped_column(LargeBinary)
+    authenticated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )

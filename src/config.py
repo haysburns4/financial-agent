@@ -27,6 +27,11 @@ class Settings(BaseSettings):
 
     DISCORD_WEBHOOK_URL: str | None = None
 
+    # Fernet key for encrypting persisted E-Trade tokens. Generate with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # If unset, tokens are kept in memory only (current behavior, no persistence).
+    TOKEN_ENCRYPTION_KEY: str | None = None
+
     LOG_LEVEL: str = "INFO"
 
     @field_validator("WATCHLIST", mode="before")
