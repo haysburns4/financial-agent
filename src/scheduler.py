@@ -13,6 +13,7 @@ from src.db import engine
 from src.etrade.accounts import ETradeAccountClient
 from src.etrade.auth import auth
 from src.etrade.market import ETradeMarketClient
+from src.pipelines import monitored_tickers
 from src.pipelines.portfolio_pipeline import PortfolioPipeline
 from src.pipelines.price_pipeline import PricePipeline
 from src.signals.engine import SignalEngine
@@ -45,8 +46,10 @@ signal_engine = SignalEngine(engine)
 
 
 async def _price_then_signals() -> None:
-    await price_pipeline.run(settings.WATCHLIST)
-    await signal_engine.run_all(settings.WATCHLIST)
+    tickers = await monitored_tickers(engine)
+    logger.info("price_pipeline firing for {} ticker(s): {}", len(tickers), tickers)
+    await price_pipeline.run(tickers)
+    await signal_engine.run_all(tickers)
     sent = await deliver_pending_signals()
     if sent:
         logger.info("Discord delivered {} signal(s)", sent)
@@ -59,7 +62,6 @@ def _price_job() -> None:
     if not auth.is_authenticated():
         logger.warning("price_pipeline skipped: E-Trade not authenticated")
         return
-    logger.info("price_pipeline firing for {} tickers", len(settings.WATCHLIST))
     try:
         asyncio.run(_price_then_signals())
     except Exception:

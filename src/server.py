@@ -3,10 +3,10 @@ from pydantic import BaseModel
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from src.config import settings
-from src.db import get_connection, health_check
+from src.db import engine, get_connection, health_check
 from src.etrade.auth import auth
 from src.models import Indicator, PipelineRun, Position, PriceBar, Signal
+from src.pipelines import monitored_tickers
 from src.scheduler import portfolio_pipeline, price_pipeline
 from src.signals.engine import SIGNAL_CATEGORIES, signal_types_for_category
 
@@ -41,14 +41,19 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/pipeline/price/run")
-    async def trigger_price_run():
+    async def trigger_price_run(tickers: str | None = None):
         if not auth.is_authenticated():
             raise HTTPException(status_code=401, detail="E-Trade not authenticated")
-        result = await price_pipeline.run(settings.WATCHLIST)
+        if tickers:
+            ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        else:
+            ticker_list = await monitored_tickers(engine)
+        result = await price_pipeline.run(ticker_list)
         return {
             "status": result.status,
             "started_at": result.started_at.isoformat(),
             "completed_at": result.completed_at.isoformat(),
+            "tickers": ticker_list,
             "tickers_processed": result.tickers_processed,
             "tickers_skipped": result.tickers_skipped,
             "bars_stored": result.bars_stored,

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import update
+from sqlalchemy import delete, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -76,8 +76,7 @@ class PortfolioPipeline:
                     async with conn.begin_nested():
                         raw = await self._accounts.get_positions(account_id_key)
                         normalized = self._normalize(account_id, raw)
-                        if normalized:
-                            await self._upsert(conn, normalized)
+                        pruned = await self._reconcile(conn, account_id, normalized)
                         positions_stored += len(normalized)
                         accounts_processed += 1
 
@@ -88,13 +87,23 @@ class PortfolioPipeline:
                             "tickers": tickers,
                             "position_count": len(normalized),
                             "total_market_value": total_mv,
+                            "positions_pruned": pruned,
                         })
-                        logger.info(
-                            "Account {}: {} positions, ${:,.0f} market value",
-                            account_id,
-                            len(normalized),
-                            total_mv,
-                        )
+                        if pruned:
+                            logger.info(
+                                "Account {}: {} positions, ${:,.0f} market value ({} closed positions pruned)",
+                                account_id,
+                                len(normalized),
+                                total_mv,
+                                pruned,
+                            )
+                        else:
+                            logger.info(
+                                "Account {}: {} positions, ${:,.0f} market value",
+                                account_id,
+                                len(normalized),
+                                total_mv,
+                            )
                 except Exception as exc:
                     logger.exception("portfolio_pipeline failed for account {}", account_id)
                     errors.append(f"{account_id}: {exc}")
@@ -156,15 +165,36 @@ class PortfolioPipeline:
             )
         return rows
 
-    async def _upsert(self, conn, rows: list[dict]) -> None:
-        stmt = sqlite_insert(Position).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["account_id", "ticker"],
-            set_={
-                "quantity": stmt.excluded.quantity,
-                "cost_basis": stmt.excluded.cost_basis,
-                "market_value": stmt.excluded.market_value,
-                "last_updated": stmt.excluded.last_updated,
-            },
-        )
-        await conn.execute(stmt)
+    async def _reconcile(
+        self, conn, account_id: str, rows: list[dict]
+    ) -> int:
+        """Make `positions` for this account exactly match the rows returned.
+
+        Deletes any prior holdings that aren't in the current response
+        (closed/sold-out positions), then upserts the current set. Returns
+        the count of rows pruned so callers can surface it.
+        """
+        current = {r["ticker"] for r in rows}
+        if current:
+            del_stmt = (
+                delete(Position)
+                .where(Position.account_id == account_id)
+                .where(~Position.ticker.in_(current))
+            )
+        else:
+            del_stmt = delete(Position).where(Position.account_id == account_id)
+        pruned = (await conn.execute(del_stmt)).rowcount or 0
+
+        if rows:
+            stmt = sqlite_insert(Position).values(rows)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["account_id", "ticker"],
+                set_={
+                    "quantity": stmt.excluded.quantity,
+                    "cost_basis": stmt.excluded.cost_basis,
+                    "market_value": stmt.excluded.market_value,
+                    "last_updated": stmt.excluded.last_updated,
+                },
+            )
+            await conn.execute(stmt)
+        return pruned
