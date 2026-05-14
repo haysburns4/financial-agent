@@ -7,7 +7,14 @@ from loguru import logger
 from sqlalchemy import and_, insert, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from src.backtest import confidence_config
 from src.models import Indicator, Position, PriceBar, Signal
+
+
+def _conf(rule_name: str, fallback: float = 0.5) -> float:
+    """Look up the current calibrated weight for a rule. Read by attribute so
+    POST /backtest/apply takes effect immediately (no module reload needed)."""
+    return confidence_config.CONFIDENCE_WEIGHTS.get(rule_name, fallback)
 
 
 SIGNAL_CATEGORIES: dict[str, str] = {
@@ -165,15 +172,10 @@ class SignalEngine:
         # oversold_reversal
         if rsi is not None and rsi < 30 and hist_now is not None and hist_prev is not None:
             if hist_now > 0 and hist_prev <= 0:
-                conf = 0.6
-                if rsi < 25:
-                    conf += 0.1
-                if hist_now > 0.5:
-                    conf += 0.1
                 out.append(SignalCandidate(
                     ticker=ticker, timestamp=ts,
                     signal_type="oversold_reversal", direction="long",
-                    confidence=min(conf, 1.0),
+                    confidence=_conf("oversold_reversal"),
                     reasoning=(
                         f"RSI={rsi:.1f} (<30), MACD histogram flipped positive "
                         f"({hist_prev:.3f} → {hist_now:.3f})"
@@ -185,16 +187,10 @@ class SignalEngine:
         pe9, pe21 = _val(prev, "ema_9"), _val(prev, "ema_21")
         if None not in (e9, e21, pe9, pe21):
             if pe9 <= pe21 and e9 > e21:
-                conf = 0.6
-                if rsi is not None and 40 < rsi < 60:
-                    conf += 0.1
-                vol_avg = float(history["volume"].iloc[:-1].mean()) if len(history) > 1 else 0.0
-                if vol_avg > 0 and float(last["volume"]) > vol_avg:
-                    conf += 0.1
                 out.append(SignalCandidate(
                     ticker=ticker, timestamp=ts,
                     signal_type="golden_cross", direction="long",
-                    confidence=min(conf, 1.0),
+                    confidence=_conf("golden_cross"),
                     reasoning=f"EMA9 ({e9:.2f}) crossed above EMA21 ({e21:.2f})",
                 ))
 
@@ -206,15 +202,10 @@ class SignalEngine:
             last_close = float(last["close"])
             last_vol = float(last["volume"])
             if last_close > prior_high and vol_avg > 0 and last_vol > vol_avg:
-                conf = 0.65
-                if last_vol > vol_avg * 1.5:
-                    conf += 0.15
-                if rsi is not None and 40 < rsi < 65:
-                    conf += 0.1
                 out.append(SignalCandidate(
                     ticker=ticker, timestamp=ts,
                     signal_type="breakout", direction="long",
-                    confidence=min(conf, 1.0),
+                    confidence=_conf("breakout"),
                     reasoning=(
                         f"Close {last_close:.2f} > {self.BREAKOUT_LOOKBACK}-day high "
                         f"{prior_high:.2f} on volume {last_vol:.0f} (avg {vol_avg:.0f})"
@@ -236,15 +227,10 @@ class SignalEngine:
         # overbought_reversal
         if rsi is not None and rsi > 70 and hist_now is not None and hist_prev is not None:
             if hist_now < 0 and hist_prev >= 0:
-                conf = 0.6
-                if rsi > 75:
-                    conf += 0.1
-                if hist_now < -0.5:
-                    conf += 0.1
                 out.append(SignalCandidate(
                     ticker=ticker, timestamp=ts,
                     signal_type="overbought_reversal", direction=None,
-                    confidence=min(conf, 1.0),
+                    confidence=_conf("overbought_reversal"),
                     reasoning=(
                         f"RSI={rsi:.1f} (>70), MACD histogram flipped negative "
                         f"({hist_prev:.3f} → {hist_now:.3f})"
@@ -256,16 +242,10 @@ class SignalEngine:
         pe9, pe21 = _val(prev, "ema_9"), _val(prev, "ema_21")
         if None not in (e9, e21, pe9, pe21):
             if pe9 >= pe21 and e9 < e21:
-                conf = 0.6
-                if rsi is not None and 40 < rsi < 60:
-                    conf += 0.1
-                vol_avg = float(history["volume"].iloc[:-1].mean()) if len(history) > 1 else 0.0
-                if vol_avg > 0 and float(last["volume"]) > vol_avg:
-                    conf += 0.1
                 out.append(SignalCandidate(
                     ticker=ticker, timestamp=ts,
                     signal_type="death_cross", direction=None,
-                    confidence=min(conf, 1.0),
+                    confidence=_conf("death_cross"),
                     reasoning=f"EMA9 ({e9:.2f}) crossed below EMA21 ({e21:.2f})",
                 ))
 
@@ -280,12 +260,10 @@ class SignalEngine:
         if pnl_pct >= -0.05:
             return []
         ts = _ts(history.iloc[-1]["timestamp"]) if not history.empty else datetime.now(timezone.utc)
-        # Linear scale: -5% → 0.5, -10% → 1.0
-        confidence = min(abs(pnl_pct) / 0.10, 1.0)
         return [SignalCandidate(
             ticker=ticker, timestamp=ts,
             signal_type="stop_loss_warning", direction=None,
-            confidence=confidence,
+            confidence=_conf("stop_loss_warning"),
             reasoning=(
                 f"Position P&L {pnl_pct:.1%} "
                 f"(cost ${position['cost_basis']:.0f} → mkt ${position['market_value']:.0f})"
@@ -301,11 +279,10 @@ class SignalEngine:
         pos_pct = position["market_value"] / total_value
         if pos_pct <= 0.15:
             return []
-        confidence = min(pos_pct / 0.30, 1.0)
         return [SignalCandidate(
             ticker=ticker, timestamp=datetime.now(timezone.utc),
             signal_type="concentration_risk", direction=None,
-            confidence=confidence,
+            confidence=_conf("concentration_risk"),
             reasoning=(
                 f"{ticker} is {pos_pct:.1%} of portfolio "
                 f"(${position['market_value']:.0f} / ${total_value:.0f})"
@@ -324,12 +301,11 @@ class SignalEngine:
         drawdown = (total_cost - total_value) / total_cost
         if drawdown <= 0.10:
             return []
-        confidence = min(drawdown / 0.20, 1.0)
         return [SignalCandidate(
             ticker=self.PORTFOLIO_SENTINEL,
             timestamp=datetime.now(timezone.utc),
             signal_type="drawdown_alert", direction=None,
-            confidence=confidence,
+            confidence=_conf("drawdown_alert"),
             reasoning=(
                 f"Portfolio unrealized drawdown {drawdown:.1%} "
                 f"(cost ${total_cost:.0f} → mkt ${total_value:.0f})"

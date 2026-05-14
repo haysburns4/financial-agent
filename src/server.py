@@ -1,18 +1,40 @@
+from dataclasses import asdict
+from datetime import date
+
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from src.backtest import persistence as backtest_persistence
+from src.backtest.runner import BacktestRunner
+from src.config import settings
 from src.db import engine, get_connection, health_check
 from src.etrade.auth import auth
 from src.models import Indicator, PipelineRun, Position, PriceBar, Signal
 from src.pipelines import monitored_tickers
+from src.pipelines.backfill_pipeline import BackfillPipeline
 from src.scheduler import portfolio_pipeline, price_pipeline
 from src.signals.engine import SIGNAL_CATEGORIES, signal_types_for_category
 
 
 class CompleteAuthBody(BaseModel):
     verifier: str
+
+
+class BackfillRequest(BaseModel):
+    tickers: list[str] | None = None
+    period_daily: str = "2y"
+    period_intraday: str = "60d"
+    interval_intraday: str = "5m"
+
+
+class BacktestRequest(BaseModel):
+    tickers: list[str] | None = None
+    start_date: date
+    end_date: date
+    forward_window_days: int = 5
+    outcome_threshold_pct: float = 0.01
 
 
 def create_app() -> FastAPI:
@@ -223,6 +245,122 @@ def create_app() -> FastAPI:
             "accounts": result.accounts,
             "errors": result.errors,
         }
+
+    @app.post("/pipeline/backfill/run")
+    async def trigger_backfill(body: BackfillRequest | None = None):
+        body = body or BackfillRequest()
+        tickers = body.tickers or await monitored_tickers(engine)
+        pipeline = BackfillPipeline(engine, settings)
+        from loguru import logger
+        logger.info("backfill starting for {} ticker(s): {}", len(tickers), tickers)
+        result = await pipeline.run(
+            tickers=tickers,
+            period_daily=body.period_daily,
+            period_intraday=body.period_intraday,
+            interval_intraday=body.interval_intraday,
+        )
+        logger.info(
+            "backfill done in {:.1f}s: {} tickers, {} daily, {} intraday, {} indicators, {} errors",
+            result.duration_seconds, result.tickers_processed,
+            result.daily_bars_added, result.intraday_bars_added,
+            result.indicators_computed, len(result.errors),
+        )
+        return asdict(result)
+
+    @app.get("/prices/{ticker}/coverage")
+    async def price_coverage(
+        ticker: str,
+        conn: AsyncConnection = Depends(_conn_dep),
+    ):
+        ticker = ticker.strip().upper()
+        # Total bar count + earliest / latest.
+        bar_summary = (
+            await conn.execute(
+                select(
+                    func.count(PriceBar.id),
+                    func.min(PriceBar.timestamp),
+                    func.max(PriceBar.timestamp),
+                )
+                .where(PriceBar.ticker == ticker)
+            )
+        ).first()
+        total_bars = bar_summary[0] or 0
+        earliest = bar_summary[1]
+        latest = bar_summary[2]
+        if total_bars == 0:
+            return {
+                "ticker": ticker,
+                "daily_bars": 0,
+                "intraday_bars": 0,
+                "earliest_bar": None,
+                "latest_bar": None,
+                "indicator_coverage": 0.0,
+            }
+
+        # Crude daily vs intraday split: anything timestamped exactly on a UTC
+        # date boundary (00:00:00) is treated as a daily bar; everything else
+        # is intraday. Backfill_pipeline stamps daily bars at UTC midnight, so
+        # this matches its semantics.
+        daily_count = (
+            await conn.execute(
+                select(func.count(PriceBar.id))
+                .where(PriceBar.ticker == ticker)
+                .where(func.strftime("%H:%M:%S", PriceBar.timestamp) == "00:00:00")
+            )
+        ).scalar() or 0
+        intraday_count = total_bars - daily_count
+
+        indicator_count = (
+            await conn.execute(
+                select(func.count(Indicator.id)).where(Indicator.ticker == ticker)
+            )
+        ).scalar() or 0
+        coverage = (indicator_count / total_bars) if total_bars else 0.0
+
+        def _iso(ts):
+            if ts is None:
+                return None
+            if ts.tzinfo is None:
+                from datetime import timezone as _tz
+                ts = ts.replace(tzinfo=_tz.utc)
+            return ts.isoformat()
+
+        return {
+            "ticker": ticker,
+            "daily_bars": daily_count,
+            "intraday_bars": intraday_count,
+            "earliest_bar": _iso(earliest),
+            "latest_bar": _iso(latest),
+            "indicator_coverage": round(coverage, 4),
+        }
+
+    @app.post("/backtest/run")
+    async def trigger_backtest(body: BacktestRequest):
+        tickers = body.tickers or await monitored_tickers(engine)
+        runner = BacktestRunner(engine)
+        report = await runner.run(
+            tickers=tickers,
+            start_date=body.start_date,
+            end_date=body.end_date,
+            forward_window_days=body.forward_window_days,
+            outcome_threshold_pct=body.outcome_threshold_pct,
+        )
+        backtest_persistence.save_report(report)
+        return asdict(report)
+
+    @app.get("/backtest/latest")
+    async def latest_backtest():
+        report = backtest_persistence.load_report_json()
+        if report is None:
+            raise HTTPException(status_code=404, detail="no backtest report on disk")
+        return report
+
+    @app.post("/backtest/apply")
+    async def apply_backtest():
+        try:
+            return backtest_persistence.apply_latest_report()
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     return app
 
