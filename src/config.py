@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     ETRADE_CONSUMER_SECRET: str
     ETRADE_SANDBOX: bool = True
 
+    ANTHROPIC_API_KEY: str
+
     DATABASE_URL: str = "sqlite+aiosqlite:///data/agent.db"
 
     WATCHLIST: Annotated[list[str], NoDecode] = Field(

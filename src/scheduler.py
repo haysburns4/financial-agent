@@ -3,11 +3,15 @@ import asyncio
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
+import anthropic
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
-from src.alerts.discord import deliver_pending_signals
+from src.agent.chat import AgentChat
+from src.agent.synthesizer import SignalSynthesizer
+from src.alerts.discord import deliver_pending_signals, post_daily_briefing
 from src.config import settings
 from src.db import engine
 from src.etrade.accounts import ETradeAccountClient
@@ -43,6 +47,9 @@ account_client = ETradeAccountClient(auth)
 price_pipeline = PricePipeline(market_client, engine)
 portfolio_pipeline = PortfolioPipeline(account_client, engine)
 signal_engine = SignalEngine(engine)
+anthropic_client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+signal_synthesizer = SignalSynthesizer(anthropic_client)
+agent_chat = AgentChat(engine, anthropic_client)
 
 
 async def _price_then_signals() -> None:
@@ -53,9 +60,24 @@ async def _price_then_signals() -> None:
     logger.info("price_pipeline firing for {} ticker(s): {}", len(tickers), tickers)
     await price_pipeline.run(tickers)
     await signal_engine.run_all(tickers)
+    # Per-tick Discord delivery is raw (no synthesizer) so we don't hit
+    # Claude every 5 minutes. The synthesizer runs once daily via the
+    # `_daily_briefing_job` cron job below, or on demand via /signals/synthesize.
     sent = await deliver_pending_signals()
     if sent:
         logger.info("Discord delivered {} signal(s)", sent)
+
+
+async def _daily_briefing_run() -> None:
+    logger.info("daily briefing firing")
+    await post_daily_briefing(signal_synthesizer)
+
+
+def _daily_briefing_job() -> None:
+    try:
+        asyncio.run(_daily_briefing_run())
+    except Exception:
+        logger.exception("daily_briefing raised")
 
 
 def _price_job() -> None:
@@ -102,5 +124,14 @@ def build_scheduler() -> BackgroundScheduler:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=60,
+    )
+    scheduler.add_job(
+        _daily_briefing_job,
+        trigger=CronTrigger(hour=9, minute=35, timezone=_NYSE_TZ),
+        id="daily_briefing",
+        name="daily_briefing",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
     )
     return scheduler

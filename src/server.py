@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from src.alerts.discord import build_synthesis_context
 from src.backtest import persistence as backtest_persistence
 from src.backtest.runner import BacktestRunner
 from src.config import settings
@@ -14,7 +15,12 @@ from src.etrade.auth import auth
 from src.models import Indicator, PipelineRun, Position, PriceBar, Signal
 from src.pipelines import monitored_tickers
 from src.pipelines.backfill_pipeline import BackfillPipeline
-from src.scheduler import portfolio_pipeline, price_pipeline
+from src.scheduler import (
+    agent_chat,
+    portfolio_pipeline,
+    price_pipeline,
+    signal_synthesizer,
+)
 from src.signals.engine import SIGNAL_CATEGORIES, signal_types_for_category
 
 
@@ -35,6 +41,16 @@ class BacktestRequest(BaseModel):
     end_date: date
     forward_window_days: int = 5
     outcome_threshold_pct: float = 0.01
+
+
+class ChatTurn(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    question: str
+    conversation_history: list[ChatTurn] | None = None
 
 
 def create_app() -> FastAPI:
@@ -361,6 +377,68 @@ def create_app() -> FastAPI:
             return backtest_persistence.apply_latest_report()
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/chat")
+    async def chat(body: ChatRequest):
+        history = (
+            [{"role": t.role, "content": t.content} for t in body.conversation_history]
+            if body.conversation_history
+            else None
+        )
+        try:
+            return await agent_chat.ask(body.question, history)
+        except Exception as exc:
+            from loguru import logger
+            logger.exception("/chat failed")
+            raise HTTPException(status_code=500, detail=f"chat failed: {exc}") from exc
+
+    @app.post("/signals/synthesize")
+    async def synthesize_signals(conn: AsyncConnection = Depends(_conn_dep)):
+        rows = (
+            await conn.execute(
+                select(Signal)
+                .where(Signal.delivered.is_(False))
+                .order_by(Signal.created_at)
+            )
+        ).all()
+        if not rows:
+            return {"narrative": "No undelivered signals.", "signals": []}
+
+        signal_dicts = [
+            {
+                "id": r.id,
+                "ticker": r.ticker,
+                "timestamp": r.timestamp,
+                "signal_type": r.signal_type,
+                "direction": r.direction,
+                "confidence": r.confidence,
+                "reasoning": r.reasoning,
+            }
+            for r in rows
+        ]
+        try:
+            context = await build_synthesis_context(conn, signal_dicts)
+            narrative = await signal_synthesizer.synthesize(signal_dicts, context)
+        except Exception as exc:
+            from loguru import logger
+            logger.exception("/signals/synthesize failed")
+            raise HTTPException(
+                status_code=500, detail=f"synthesis failed: {exc}"
+            ) from exc
+
+        return {
+            "narrative": narrative,
+            "signals": [
+                {
+                    "id": s["id"],
+                    "ticker": s["ticker"],
+                    "signal_type": s["signal_type"],
+                    "direction": s["direction"],
+                    "confidence": s["confidence"],
+                }
+                for s in signal_dicts
+            ],
+        }
 
     return app
 
