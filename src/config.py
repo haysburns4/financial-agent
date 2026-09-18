@@ -16,7 +16,13 @@ class Settings(BaseSettings):
     ETRADE_CONSUMER_SECRET: str
     ETRADE_SANDBOX: bool = True
 
-    ANTHROPIC_API_KEY: str
+    # Only the selected provider's key is required; build_backend() raises
+    # LLMConfigError at startup if the one in use is missing.
+    LLM_PROVIDER: str = "anthropic"
+    LLM_CHAT_MODEL: str = "claude-opus-5"
+    LLM_SYNTHESIS_MODEL: str = "claude-sonnet-5"
+    ANTHROPIC_API_KEY: str | None = None
+    OPENAI_API_KEY: str | None = None
 
     DATABASE_URL: str = "sqlite+aiosqlite:///data/agent.db"
 

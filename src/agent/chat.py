@@ -7,16 +7,17 @@ storage. History is capped at the last `MAX_HISTORY_TURNS` user+assistant
 turns to keep context bounded.
 """
 import re
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import anthropic
 from loguru import logger
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from src.config import settings
 from src.etrade.auth import auth as etrade_auth
+from src.llm import Delta, LLMBackend, LLMError, Message, collect
 from src.models import Indicator, Position, PriceBar, Signal
 
 
@@ -36,29 +37,83 @@ _TICKER_RE = re.compile(r"\b([A-Z]{1,5}(?:\.[A-Z])?)\b")
 
 
 class AgentChat:
-    MODEL = "claude-opus-4-7"
     MAX_TOKENS = 2048
     MAX_HISTORY_TURNS = 10
     BARS_PER_TICKER = 20
     SIGNAL_LOOKBACK_HOURS = 24
 
-    def __init__(self, engine: AsyncEngine, client: anthropic.AsyncAnthropic) -> None:
+    def __init__(self, engine: AsyncEngine, backend: LLMBackend) -> None:
         self._engine = engine
-        self._client = client
+        self._backend = backend
 
     async def ask(
         self,
         question: str,
         conversation_history: list[dict] | None = None,
     ) -> dict:
+        system_prompt, messages, ctx = await self._prepare(question, conversation_history)
+        try:
+            response = await collect(
+                self._backend.stream(
+                    system=system_prompt,
+                    messages=messages,
+                    max_tokens=self.MAX_TOKENS,
+                )
+            )
+        except LLMError:
+            logger.exception("AgentChat: {} call failed", self._backend.provider)
+            raise
+
+        if response.stop_reason == "refusal":
+            logger.warning("chat: provider refused the request")
+
+        answer = response.text.strip()
+        logger.info(
+            "chat: {} -> {} chars ({} in / {} out tokens, {}/{})",
+            question[:60].replace("\n", " "),
+            len(answer),
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+            self._backend.provider,
+            self._backend.model,
+        )
+
+        return {"answer": answer, "context_used": self._context_used(answer, ctx)}
+
+    async def ask_stream(
+        self,
+        question: str,
+        conversation_history: list[dict] | None = None,
+    ) -> AsyncIterator[Delta]:
+        """`ask` in streaming form, for the AG-UI/CopilotKit endpoint.
+
+        The terminal `MessageComplete` carries the full answer, so a caller
+        wanting `context_used` can build it from there via `_context_used`.
+        """
+        system_prompt, messages, _ = await self._prepare(question, conversation_history)
+        try:
+            async for delta in self._backend.stream(
+                system=system_prompt,
+                messages=messages,
+                max_tokens=self.MAX_TOKENS,
+            ):
+                yield delta
+        except LLMError:
+            logger.exception("AgentChat: {} stream failed", self._backend.provider)
+            raise
+
+    async def _prepare(
+        self,
+        question: str,
+        conversation_history: list[dict] | None,
+    ) -> tuple[str, list[Message], dict]:
+        """Load context, render the system prompt, and build the turn list."""
         async with self._engine.begin() as conn:
             bars_by_ticker = await self._load_bars(conn)
             positions = await self._load_positions(conn)
             recent_signals = await self._load_recent_signals(conn)
 
-        data_freshness = self._compute_freshness(bars_by_ticker)
         data_context = self._format_data_context(bars_by_ticker, positions, recent_signals)
-
         system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(data_context=data_context)
         if not await etrade_auth.is_authenticated():
             system_prompt += (
@@ -66,35 +121,20 @@ class AgentChat:
                 "so position and balance data may be stale. Flag this if relevant."
             )
 
-        messages = self._build_messages(question, conversation_history)
-        try:
-            response = await self._client.messages.create(
-                model=self.MODEL,
-                max_tokens=self.MAX_TOKENS,
-                system=system_prompt,
-                messages=messages,
-            )
-        except anthropic.APIError:
-            logger.exception("AgentChat: Anthropic API call failed")
-            raise
+        ctx = {
+            "bars_by_ticker": bars_by_ticker,
+            "positions": positions,
+            "recent_signals": recent_signals,
+            "data_freshness_minutes": self._compute_freshness(bars_by_ticker),
+        }
+        return system_prompt, self._build_messages(question, conversation_history), ctx
 
-        answer = next((b.text for b in response.content if b.type == "text"), "").strip()
-        logger.info(
-            "chat: {} -> {} chars ({} in / {} out tokens)",
-            question[:60].replace("\n", " "),
-            len(answer),
-            response.usage.input_tokens,
-            response.usage.output_tokens,
-        )
-
+    def _context_used(self, answer: str, ctx: dict) -> dict:
         return {
-            "answer": answer,
-            "context_used": {
-                "tickers_referenced": self._extract_tickers(answer, bars_by_ticker.keys()),
-                "positions_referenced": self._extract_position_tickers(answer, positions),
-                "signals_referenced": self._extract_signal_ids(answer, recent_signals),
-                "data_freshness_minutes": data_freshness,
-            },
+            "tickers_referenced": self._extract_tickers(answer, ctx["bars_by_ticker"].keys()),
+            "positions_referenced": self._extract_position_tickers(answer, ctx["positions"]),
+            "signals_referenced": self._extract_signal_ids(answer, ctx["recent_signals"]),
+            "data_freshness_minutes": ctx["data_freshness_minutes"],
         }
 
     # ---------- context loaders ----------
@@ -241,16 +281,16 @@ class AgentChat:
         self,
         question: str,
         history: list[dict] | None,
-    ) -> list[dict]:
-        messages: list[dict] = []
+    ) -> list[Message]:
+        messages: list[Message] = []
         if history:
             trimmed = history[-(self.MAX_HISTORY_TURNS * 2):]
             for turn in trimmed:
                 role = turn.get("role")
                 content = turn.get("content", "")
                 if role in ("user", "assistant") and content:
-                    messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": question})
+                    messages.append(Message(role=role, text=content))
+        messages.append(Message(role="user", text=question))
         return messages
 
     # ---------- context-used extraction ----------

@@ -28,7 +28,15 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
+# Alternate LLM provider for LLM_PROVIDER=openai. Not needed for the default
+# anthropic backend; see src/llm/factory.py.
+openai = [
+    "openai>=1.51",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The app runs as `python -m src.main` from the repo root rather than as an
+# installed package, so tests need the root on sys.path too.
+pythonpath = ["."]

@@ -12,6 +12,7 @@ Automated market data collection, technical signal generation, and portfolio mon
 - **Data source:** E-Trade API via `pyetrade` (OAuth 1.0a)
 - **Scheduler:** APScheduler 3.x
 - **Indicators:** pandas-ta
+- **LLM:** provider-neutral layer (`src/llm/`); Anthropic by default, OpenAI optional
 
 ## Setup
 
@@ -26,7 +27,7 @@ Automated market data collection, technical signal generation, and portfolio mon
    ```
 4. Install with test deps:
    ```
-   uv sync --group dev
+   uv sync --extra dev
    ```
 5. Configure secrets:
    ```
@@ -37,6 +38,33 @@ Automated market data collection, technical signal generation, and portfolio mon
    ```
    uv run python -m src.main
    ```
+
+## LLM provider
+
+`src/agent/` depends on the `LLMBackend` Protocol in `src/llm/base.py`, so switching providers is configuration rather than code:
+
+```
+LLM_PROVIDER=anthropic          # anthropic | openai
+LLM_CHAT_MODEL=claude-opus-5
+LLM_SYNTHESIS_MODEL=claude-sonnet-5
+ANTHROPIC_API_KEY=...
+```
+
+For OpenAI, `uv sync --extra openai` and set `LLM_PROVIDER=openai`, the two model
+names, and `OPENAI_API_KEY`. Only the selected provider's key is required —
+`build_backend()` raises `LLMConfigError` at startup if the provider is unknown,
+uninstalled, or missing its key.
+
+The layer is streaming-first: `stream()` yields `TextDelta` / `ToolCallDelta` and
+ends with a `MessageComplete` carrying the finished message, parsed tool calls and
+token usage; `collect()` drains it for callers that only want the final answer.
+Tool calling is in the neutral types (`ToolDef`, `ToolCall`, `ToolResult`) but no
+caller passes tools yet.
+
+To add a provider, implement `stream()` in `src/llm/<name>_backend.py`, re-raising
+vendor errors as `LLMError` subclasses, and register it in `src/llm/factory.py`
+with a lazy import. Keep wire translation in module-level `_to_*` helpers so it
+stays testable without a client — see `tests/test_translation.py`.
 
 ## Schema changes
 

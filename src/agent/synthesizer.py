@@ -1,14 +1,15 @@
 """Signal synthesizer — turn a batch of raw signals into a concise briefing.
 
-Wraps the Anthropic Claude API. Given a list of signal dicts plus context
+Goes through the provider-neutral LLM layer. Given a list of signal dicts plus context
 (positions and recent bars per ticker), asks Claude to produce a ≤200-word
 actionable briefing. Callers (Discord alerter, /signals/synthesize endpoint)
 substitute this narrative for raw per-signal posts.
 """
 from typing import Any
 
-import anthropic
 from loguru import logger
+
+from src.llm import LLMBackend, Message, collect
 
 
 _SYSTEM_PROMPT = (
@@ -22,11 +23,10 @@ _SYSTEM_PROMPT = (
 
 
 class SignalSynthesizer:
-    MODEL = "claude-sonnet-4-6"
     MAX_TOKENS = 1024
 
-    def __init__(self, client: anthropic.AsyncAnthropic) -> None:
-        self._client = client
+    def __init__(self, backend: LLMBackend) -> None:
+        self._backend = backend
 
     async def synthesize(self, signals: list[dict], context: dict) -> str:
         """Produce a narrative summary for the given signals.
@@ -40,19 +40,23 @@ class SignalSynthesizer:
         if not signals:
             return "No new signals."
         user_message = self._render_user_message(signals, context)
-        response = await self._client.messages.create(
-            model=self.MODEL,
-            max_tokens=self.MAX_TOKENS,
-            system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+        response = await collect(
+            self._backend.stream(
+                system=_SYSTEM_PROMPT,
+                messages=[Message(role="user", text=user_message)],
+                max_tokens=self.MAX_TOKENS,
+            )
         )
-        text = next((b.text for b in response.content if b.type == "text"), "").strip()
+        text = response.text.strip()
         logger.info(
-            "synthesizer: {} signal(s) -> {} char briefing ({} in / {} out tokens)",
+            "synthesizer: {} signal(s) -> {} char briefing "
+            "({} in / {} out tokens, {}/{})",
             len(signals),
             len(text),
             response.usage.input_tokens,
             response.usage.output_tokens,
+            self._backend.provider,
+            self._backend.model,
         )
         return text
 
