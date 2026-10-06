@@ -11,17 +11,32 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from src.llm import Delta, Message, MessageComplete, TextDelta, Usage
+import json
+
+from src.llm import (
+    Delta,
+    Message,
+    MessageComplete,
+    TextDelta,
+    ToolCall,
+    ToolCallDelta,
+    Usage,
+)
 from src.models import Base
 
 
 class FakeBackend:
-    """An `LLMBackend` that replays a scripted list of deltas."""
+    """An `LLMBackend` that replays scripted deltas, one script per turn.
+
+    Pass a flat list of deltas for a single-turn reply, or a list of lists to
+    script a tool loop — turn 1 asks for tools, turn 2 answers.
+    """
 
     provider = "fake"
 
     def __init__(self, deltas: Sequence[Delta] | None = None, model: str = "fake-1") -> None:
-        self._deltas = list(deltas or [])
+        script = list(deltas or [])
+        self._turns = script if script and isinstance(script[0], list) else [script]
         self._model = model
         self.calls: list[dict[str, Any]] = []
 
@@ -36,7 +51,7 @@ class FakeBackend:
         messages: Sequence[Message],
         tools: Sequence[Any] = (),
         max_tokens: int = 4096,
-        **extra: Any,
+        **extra: Any,  # anti-slop: allow no-any-parameters - mirrors the LLMBackend Protocol
     ) -> AsyncIterator[Delta]:
         self.calls.append(
             {
@@ -47,7 +62,9 @@ class FakeBackend:
                 "extra": extra,
             }
         )
-        for delta in self._deltas:
+        turn = len(self.calls) - 1
+        assert turn < len(self._turns), f"FakeBackend has no script for turn {turn + 1}"
+        for delta in self._turns[turn]:
             yield delta
 
 
@@ -58,6 +75,20 @@ def text_reply(text: str) -> list[Delta]:
         MessageComplete(
             message=Message(role="assistant", text=text),
             stop_reason="end_turn",
+            usage=Usage(input_tokens=10, output_tokens=5),
+        ),
+    ]
+
+
+def tool_reply(name: str, arguments: dict, call_id: str = "c1") -> list[Delta]:
+    """A scripted stream in which the model asks to run one tool."""
+    call = ToolCall(id=call_id, name=name, arguments=arguments)
+    return [
+        ToolCallDelta(index=0, id=call_id, name=name),
+        ToolCallDelta(index=0, arguments_json=json.dumps(arguments)),
+        MessageComplete(
+            message=Message(role="assistant", tool_calls=(call,)),
+            stop_reason="tool_use",
             usage=Usage(input_tokens=10, output_tokens=5),
         ),
     ]

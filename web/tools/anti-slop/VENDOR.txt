@@ -1,0 +1,5 @@
+Vendored from https://github.com/tobi/qmd/tree/main/tools/oxlint/anti-slop,
+which is itself vendored from https://github.com/dmmulroy/anti-slop (MIT).
+
+Retrieved 2026-09-18. Rule sources unmodified; only the test files were omitted.
+The Python counterpart of this ruleset lives in ../../tools/anti_slop.py.

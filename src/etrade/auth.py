@@ -15,38 +15,75 @@ Persistence (encrypt/decrypt + DB I/O) lives in [src/etrade/token_store.py];
 this module only owns the in-memory state and the OAuth/renewal lifecycle.
 """
 import asyncio
+import re
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 import pyetrade
 from loguru import logger
+from requests_oauthlib.oauth1_session import TokenRequestDenied
 
 from src.config import settings
 from src.etrade import token_store
 from src.etrade.token_store import ETradeTokens  # re-exported for callers
 
 
+class ETradeAuthError(Exception):
+    """E-Trade refused the OAuth handshake.
+
+    Raised instead of leaking `TokenRequestDenied` and a page of HTML;
+    `oauth_problem` carries E-Trade's reason, e.g. `consumer_key_rejected`.
+    """
+
+    def __init__(self, message: str, oauth_problem: str | None = None) -> None:
+        super().__init__(message)
+        self.oauth_problem = oauth_problem
+
+
+def _denied(exc: TokenRequestDenied, stage: str) -> ETradeAuthError:
+    # Don't touch exc.status_code — it dereferences exc.response, which is
+    # optional. The reason we want is in the body E-Trade echoed back.
+    match = re.search(r"oauth_problem=([A-Za-z_]+)", str(exc))
+    problem = match.group(1) if match else None
+    return ETradeAuthError(
+        f"E-Trade rejected the {stage} request: {problem or str(exc)[:200]}",
+        problem,
+    )
+
+
 class ETradeAuth:
     RENEW_THRESHOLD_MIN = 110
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        oauth_factory: Callable[[str, str], pyetrade.ETradeOAuth] = pyetrade.ETradeOAuth,
+    ) -> None:
+        # Injected so tests can supply a stand-in without patching an import path.
+        self._oauth_factory = oauth_factory
         self._oauth: pyetrade.ETradeOAuth | None = None
         self._tokens: ETradeTokens | None = None
 
     # ---------- OAuth flow ----------
 
     def start_auth(self) -> str:
-        self._oauth = pyetrade.ETradeOAuth(
+        self._oauth = self._oauth_factory(
             settings.ETRADE_CONSUMER_KEY,
             settings.ETRADE_CONSUMER_SECRET,
         )
-        url = self._oauth.get_request_token()
+        try:
+            url = self._oauth.get_request_token()
+        except TokenRequestDenied as exc:
+            raise _denied(exc, "request token") from exc
         logger.info("E-Trade auth started; visit URL to obtain verifier: {}", url)
         return url
 
     async def complete_auth(self, verifier: str) -> None:
         if self._oauth is None:
             raise RuntimeError("complete_auth() called before start_auth()")
-        tokens = self._oauth.get_access_token(verifier)
+        try:
+            tokens = self._oauth.get_access_token(verifier)
+        except TokenRequestDenied as exc:
+            raise _denied(exc, "access token") from exc
         now = datetime.now(timezone.utc)
         self._tokens = ETradeTokens(
             oauth_token=tokens["oauth_token"],

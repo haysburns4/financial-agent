@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import openai
+from openai.types.completion_usage import CompletionUsage
 
 from src.llm.base import (
     Delta,
@@ -104,7 +105,7 @@ class OpenAIBackend:
         messages: Sequence[Message],
         tools: Sequence[ToolDef] = (),
         max_tokens: int = 4096,
-        **extra: Any,
+        **extra: Any,  # anti-slop: allow no-any-parameters - provider passthrough is the documented Protocol contract
     ) -> AsyncIterator[Delta]:
         request: dict[str, Any] = {
             "model": self._model,
@@ -113,9 +114,10 @@ class OpenAIBackend:
             "messages": _to_openai_messages(system, messages),
             "stream": True,
             "stream_options": {"include_usage": True},
-            **({"tools": _to_openai_tools(tools)} if tools else {}),
-            **extra,
         }
+        if tools:
+            request["tools"] = _to_openai_tools(tools)
+        request.update(extra)
 
         text_parts: list[str] = []
         calls: dict[int, dict[str, str]] = {}  # tool calls arrive keyed by index, not id
@@ -176,8 +178,8 @@ class OpenAIBackend:
         )
 
 
-def _to_usage(raw: Any) -> Usage:
-    details = getattr(raw, "prompt_tokens_details", None)
+def _to_usage(raw: CompletionUsage) -> Usage:
+    details = raw.prompt_tokens_details
     return Usage(
         input_tokens=raw.prompt_tokens or 0,
         output_tokens=raw.completion_tokens or 0,

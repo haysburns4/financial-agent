@@ -14,7 +14,7 @@ _SUPPORTED = ("anthropic", "openai")
 
 
 @lru_cache(maxsize=None)
-def _client(provider: str) -> Any:
+def _client(provider: str) -> Any:  # anti-slop: allow no-any-returns - the provider SDKs are imported lazily, so their union cannot be spelled here
     """One shared client per provider; backends differ only by model."""
     if provider == "anthropic":
         import anthropic

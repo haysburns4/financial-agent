@@ -13,14 +13,14 @@ from tenacity import (
 from src.etrade.auth import ETradeAuth
 
 
-def _to_float(value: Any, default: float = 0.0) -> float:
+def _to_float(value: Any, default: float = 0.0) -> float:  # anti-slop: allow no-any-parameters - coerces untyped E-Trade JSON at the API boundary
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
 
 
-def _as_list(value: Any) -> list:
+def _as_list(value: Any) -> list:  # anti-slop: allow no-any-parameters - coerces untyped E-Trade JSON at the API boundary
     if value is None:
         return []
     if isinstance(value, list):

@@ -1,19 +1,21 @@
 from dataclasses import asdict
-from datetime import date
+from datetime import date, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from src.agui import create_agui_router
 from src.alerts.discord import build_synthesis_context
 from src.backtest import persistence as backtest_persistence
 from src.backtest.runner import BacktestRunner
 from src.config import settings
 from src.db import engine, get_connection, health_check
-from src.etrade.auth import auth
+from src.etrade.auth import ETradeAuthError, auth
 from src.models import Indicator, PipelineRun, Position, PriceBar, Signal
 from src.pipelines import monitored_tickers
+from src.portfolio import dashboard, position_dict, risk_by_account, risk_summary
 from src.pipelines.backfill_pipeline import BackfillPipeline
 from src.scheduler import (
     agent_chat,
@@ -55,6 +57,7 @@ class ChatRequest(BaseModel):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="financial-agent", version="0.1.0")
+    app.include_router(create_agui_router(agent_chat))
 
     @app.get("/health")
     async def health():
@@ -63,12 +66,18 @@ def create_app() -> FastAPI:
 
     @app.post("/auth/start")
     async def auth_start():
-        url = auth.start_auth()
+        try:
+            url = auth.start_auth()
+        except ETradeAuthError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         return {"auth_url": url}
 
     @app.post("/auth/complete")
     async def auth_complete(body: CompleteAuthBody):
-        await auth.complete_auth(body.verifier)
+        try:
+            await auth.complete_auth(body.verifier)
+        except ETradeAuthError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         return {"authenticated": True}
 
     @app.post("/auth/logout")
@@ -215,7 +224,7 @@ def create_app() -> FastAPI:
         if account_id is not None:
             stmt = stmt.where(Position.account_id == account_id)
         rows = (await conn.execute(stmt)).all()
-        positions = [_position_dict(r) for r in rows]
+        positions = [position_dict(r) for r in rows]
 
         if account_id is not None:
             return positions
@@ -231,21 +240,27 @@ def create_app() -> FastAPI:
             bucket["total_market_value"] += p["market_value"]
         return dict(sorted(grouped.items()))
 
+    @app.get("/dashboard")
+    async def get_dashboard(conn: AsyncConnection = Depends(_conn_dep)):
+        """Portfolio panel payload for the web UI: totals, accounts, auth state."""
+        rows = (await conn.execute(select(Position))).all()
+        data = dashboard(rows)
+        last_updated = data["last_updated"]
+        if last_updated is not None and last_updated.tzinfo is None:
+            # SQLite drops the offset; positions are always written in UTC.
+            last_updated = last_updated.replace(tzinfo=timezone.utc)
+        return {
+            **data,
+            "last_updated": last_updated.isoformat() if last_updated else None,
+            "authenticated": await auth.is_authenticated(),
+        }
+
     @app.get("/portfolio/risk")
     async def portfolio_risk(conn: AsyncConnection = Depends(_conn_dep)):
-        stmt = select(Position)
-        rows = (await conn.execute(stmt)).all()
+        rows = (await conn.execute(select(Position))).all()
         if not rows:
-            return {"combined": _risk_for([]), "by_account": {}}
-
-        by_account: dict[str, list] = {}
-        for r in rows:
-            by_account.setdefault(r.account_id, []).append(r)
-
-        return {
-            "combined": _risk_for(rows),
-            "by_account": {acct: _risk_for(positions) for acct, positions in sorted(by_account.items())},
-        }
+            return {"combined": risk_summary([]), "by_account": {}}
+        return risk_by_account(rows)
 
     @app.post("/pipeline/portfolio/run")
     async def trigger_portfolio_run():
@@ -446,43 +461,3 @@ def create_app() -> FastAPI:
 async def _conn_dep():
     async with get_connection() as conn:
         yield conn
-
-
-def _position_dict(r) -> dict:
-    pnl = r.market_value - r.cost_basis
-    return {
-        "account_id": r.account_id,
-        "ticker": r.ticker,
-        "quantity": r.quantity,
-        "cost_basis": r.cost_basis,
-        "market_value": r.market_value,
-        "pnl": pnl,
-        "pnl_pct": (pnl / r.cost_basis) if r.cost_basis else None,
-        "last_updated": r.last_updated.isoformat(),
-    }
-
-
-def _risk_for(positions: list) -> dict:
-    """Risk metrics for an arbitrary set of positions (one account or combined)."""
-    total_exposure = sum(p.market_value for p in positions)
-    total_cost = sum(p.cost_basis for p in positions)
-    concentration = sorted(
-        (
-            {
-                "ticker": p.ticker,
-                "market_value": p.market_value,
-                "pct_of_portfolio": (p.market_value / total_exposure) if total_exposure else 0.0,
-            }
-            for p in positions
-        ),
-        key=lambda x: x["pct_of_portfolio"],
-        reverse=True,
-    )
-    # Proxy for true peak-to-trough drawdown until we persist portfolio snapshots.
-    drawdown = (total_cost - total_exposure) / total_cost if total_cost > 0 else None
-    return {
-        "total_exposure": total_exposure,
-        "concentration": concentration,
-        "drawdown": drawdown,
-        "position_count": len(positions),
-    }

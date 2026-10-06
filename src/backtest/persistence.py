@@ -24,7 +24,7 @@ def report_path() -> Path:
     return _REPORT_PATH
 
 
-def _json_default(obj: Any):
+def _json_default(obj: Any):  # anti-slop: allow no-any-parameters - signature is dictated by json.dumps(default=...)
     if isinstance(obj, datetime):
         return obj.isoformat()
     if isinstance(obj, date):

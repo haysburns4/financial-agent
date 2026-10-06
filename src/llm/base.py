@@ -149,7 +149,7 @@ class LLMBackend(Protocol):
         messages: Sequence[Message],
         tools: Sequence[ToolDef] = (),
         max_tokens: int = 4096,
-        **extra: Any,
+        **extra: Any,  # anti-slop: allow no-any-parameters - provider-specific knobs are opaque here by design
     ) -> AsyncIterator[Delta]:
         """Stream a completion.
 

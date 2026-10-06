@@ -1,0 +1,31 @@
+{
+  "name": "financial-agent-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "lint:slop": "oxlint --config oxlint.config.ts app"
+  },
+  "dependencies": {
+    "@ag-ui/client": "0.0.59",
+    "@copilotkit/react-core": "^1.72.0",
+    "@copilotkit/react-ui": "^1.72.0",
+    "@copilotkit/runtime": "^1.72.0",
+    "next": "^16.3.5",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "^1.83.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "oxlint": "^1.83.0",
+    "typescript": "^5.6.0"
+  },
+  "type": "module"
+}

@@ -110,7 +110,7 @@ class SignalSynthesizer:
         return "\n".join(lines)
 
 
-def _fmt(value: Any) -> str:
+def _fmt(value: Any) -> str:  # anti-slop: allow no-any-parameters - indicator values arrive from DB rows as float/None/Decimal
     if value is None:
         return "n/a"
     try:

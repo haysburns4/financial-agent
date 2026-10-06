@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import anthropic
+from anthropic.lib.streaming import ParsedMessageStreamEvent
 
 from src.llm.base import (
     Delta,
@@ -20,6 +21,7 @@ from src.llm.base import (
     ToolCall,
     ToolCallDelta,
     ToolDef,
+    ToolResult,
     Usage,
 )
 
@@ -38,6 +40,17 @@ def _to_anthropic_tools(tools: Sequence[ToolDef]) -> list[dict]:
     ]
 
 
+def _tool_result_block(result: ToolResult) -> dict:
+    block = {
+        "type": "tool_result",
+        "tool_use_id": result.call_id,
+        "content": result.content,
+    }
+    if result.is_error:
+        block["is_error"] = True
+    return block
+
+
 def _to_anthropic_messages(messages: Sequence[Message]) -> list[dict]:
     """Neutral turns -> Messages API turns."""
     out: list[dict] = []
@@ -47,15 +60,7 @@ def _to_anthropic_messages(messages: Sequence[Message]) -> list[dict]:
             out.append(
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": r.call_id,
-                            "content": r.content,
-                            **({"is_error": True} if r.is_error else {}),
-                        }
-                        for r in m.tool_results
-                    ],
+                    "content": [_tool_result_block(r) for r in m.tool_results],
                 }
             )
             continue
@@ -90,18 +95,19 @@ class AnthropicBackend:
         messages: Sequence[Message],
         tools: Sequence[ToolDef] = (),
         max_tokens: int = 4096,
-        **extra: Any,
+        **extra: Any,  # anti-slop: allow no-any-parameters - provider passthrough is the documented Protocol contract
     ) -> AsyncIterator[Delta]:
         request: dict[str, Any] = {
             "model": self._model,
             "max_tokens": max_tokens,
             "system": system,
             "messages": _to_anthropic_messages(messages),
-            **({"tools": _to_anthropic_tools(tools)} if tools else {}),
-            # Opus 5 runs adaptive thinking when `thinking` is omitted, so send
-            # nothing by default rather than pinning a setting for the caller.
-            **extra,
         }
+        if tools:
+            request["tools"] = _to_anthropic_tools(tools)
+        # Opus 5 runs adaptive thinking when `thinking` is omitted, so send
+        # nothing by default rather than pinning a setting for the caller.
+        request.update(extra)
 
         try:
             async with self._client.messages.stream(**request) as stream:
@@ -138,7 +144,7 @@ class AnthropicBackend:
         )
 
 
-def _event_to_delta(event: Any) -> Delta | None:
+def _event_to_delta(event: ParsedMessageStreamEvent) -> Delta | None:
     """One SDK stream event -> a neutral delta, or None to ignore it."""
     if event.type == "content_block_start" and event.content_block.type == "tool_use":
         return ToolCallDelta(

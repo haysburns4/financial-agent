@@ -325,7 +325,7 @@ class PricePipeline:
             self._circuit[ticker] = _CircuitState()
 
 
-def _none_if_nan(value: Any) -> float | None:
+def _none_if_nan(value: Any) -> float | None:  # anti-slop: allow no-any-parameters - coerces pandas/numpy scalars at the dataframe boundary
     if value is None:
         return None
     try:

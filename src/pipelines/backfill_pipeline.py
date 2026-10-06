@@ -45,7 +45,7 @@ class BackfillResult:
     duration_seconds: float = 0.0
 
 
-def _none_if_nan(value: Any) -> float | None:
+def _none_if_nan(value: Any) -> float | None:  # anti-slop: allow no-any-parameters - coerces pandas/numpy scalars at the dataframe boundary
     if value is None:
         return None
     try:
@@ -80,7 +80,7 @@ def _yf_to_rows(ticker: str, df: pd.DataFrame, *, is_intraday: bool) -> list[dic
         "Close": "close", "Volume": "volume",
     })
     ts_col = df["timestamp"]
-    if getattr(ts_col.dt, "tz", None) is None:
+    if ts_col.dt.tz is None:
         df["timestamp"] = ts_col.dt.tz_localize("UTC")
     else:
         df["timestamp"] = ts_col.dt.tz_convert("UTC")

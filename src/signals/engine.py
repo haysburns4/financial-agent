@@ -60,10 +60,12 @@ def _val(series: pd.Series, key: str) -> float | None:
     if v is None:
         return None
     try:
-        if pd.isna(v):
-            return None
+        missing = pd.isna(v)
     except (TypeError, ValueError):
-        pass
+        # Non-scalar or unorderable: treat as present and let float() rule on it.
+        missing = False
+    if missing:
+        return None
     return float(v)
 
 
