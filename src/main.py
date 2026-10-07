@@ -44,7 +44,7 @@ app.router.lifespan_context = lifespan
 
 
 def main() -> None:
-    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("src.main:app", host=settings.API_HOST, port=settings.API_PORT, reload=False)
 
 
 if __name__ == "__main__":

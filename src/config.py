@@ -42,6 +42,10 @@ class Settings(BaseSettings):
 
     LOG_LEVEL: str = "INFO"
 
+    # Loopback by default: the API has no auth of its own.
+    API_HOST: str = "127.0.0.1"
+    API_PORT: int = 8000
+
     @field_validator("WATCHLIST", mode="before")
     @classmethod
     def _split_watchlist(cls, v):

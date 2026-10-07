@@ -11,7 +11,7 @@
 import { dashboardSchema, fastApiErrorSchema } from "../../portfolio";
 
 // FastAPI serves /agui and /dashboard from the same origin.
-const API_ORIGIN = new URL(process.env.AGUI_URL ?? "http://localhost:8000/agui").origin;
+const API_ORIGIN = new URL(process.env.AGUI_URL ?? "http://127.0.0.1:8000/agui").origin;
 
 async function failure(response: Response, action: string): Promise<Response> {
   const body = fastApiErrorSchema.safeParse(await response.json().catch(() => null));

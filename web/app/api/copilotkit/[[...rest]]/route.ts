@@ -8,7 +8,7 @@
 import { HttpAgent } from "@ag-ui/client";
 import { CopilotRuntime, createCopilotRuntimeHandler } from "@copilotkit/runtime/v2";
 
-const AGUI_URL = process.env.AGUI_URL ?? "http://localhost:8000/agui";
+const AGUI_URL = process.env.AGUI_URL ?? "http://127.0.0.1:8000/agui";
 
 const runtime = new CopilotRuntime({
   agents: {

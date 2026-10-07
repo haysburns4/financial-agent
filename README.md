@@ -26,19 +26,15 @@ Automated market data collection, technical signal generation, and portfolio mon
    ```
    uv sync --extra dev
    ```
-4. Create `.env` in the repo root:
+4. Create `.env` in the repo root. The setup wizard will write it for you; to do it by
+   hand instead, copy the template and fill in the blanks:
    ```
-   ETRADE_CONSUMER_KEY=...
-   ETRADE_CONSUMER_SECRET=...
-   ETRADE_SANDBOX=true             # false for your real account (needs production keys)
-   TOKEN_ENCRYPTION_KEY=...        # keeps the E-Trade login across restarts; see below
-   WATCHLIST=AAPL,MSFT,GOOGL
-
-   LLM_PROVIDER=anthropic          # anthropic | openai
-   LLM_CHAT_MODEL=claude-opus-5
-   LLM_SYNTHESIS_MODEL=claude-sonnet-5
-   ANTHROPIC_API_KEY=...           # or OPENAI_API_KEY for LLM_PROVIDER=openai
+   cp .env.example .env
+   chmod 600 .env
    ```
+   `.env.example` lists every setting with its default and a one-line description. You
+   need at least `ETRADE_CONSUMER_KEY`, `ETRADE_CONSUMER_SECRET` and the API key for your
+   `LLM_PROVIDER` (`ANTHROPIC_API_KEY` by default).
    Generate `TOKEN_ENCRYPTION_KEY` with:
    ```
    uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -55,12 +51,12 @@ Automated market data collection, technical signal generation, and portfolio mon
 
 Start the API (creates the SQLite DB on first run):
 ```
-uv run python -m src.main          # http://localhost:8000
+uv run python -m src.main          # http://127.0.0.1:8000
 ```
 
 Start the web UI in a second terminal:
 ```
-cd web && npm run dev              # http://localhost:3000
+cd web && npm run dev              # http://127.0.0.1:3000
 ```
 
 ### E-Trade login
