@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0; setup-uv publishes no floating major tags past v7
         with:
           enable-cache: true
       - name: Install
@@ -67,7 +67,7 @@ jobs:
       ANTHROPIC_API_KEY: ci-dummy
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0; setup-uv publishes no floating major tags past v7
         with:
           enable-cache: true
       # doctor checks for Node >= 20; pin it rather than rely on the runner image.
