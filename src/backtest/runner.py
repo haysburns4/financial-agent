@@ -59,6 +59,8 @@ _TIMEFRAMES = ("daily", "intraday")
 
 
 _BREAKOUT_LOOKBACK = 20
+# Bars a rule reads: the breakout lookback plus the bar being evaluated.
+RULE_WINDOW_BARS = _BREAKOUT_LOOKBACK + 1
 _MIN_EVALUATED_SAMPLES = 30
 _CONFIDENCE_FLOOR = 0.3
 _CONFIDENCE_CEILING = 0.95
@@ -459,8 +461,8 @@ class BacktestRunner:
         for ticker in tickers:
             ticker = ticker.strip().upper()
             try:
-                history = await self._load_history(ticker, start_date, end_date, timeframe)
-                daily = await self._load_daily_context(ticker, start_date, end_date)
+                history = await self.load_history(ticker, start_date, end_date, timeframe)
+                daily = await self.load_daily_context(ticker, start_date, end_date)
             except Exception:
                 logger.exception("backtest: failed to load history for {}", ticker)
                 continue
@@ -551,8 +553,8 @@ class BacktestRunner:
         tallies: dict[tuple[str, str], list[_Tally | None]] = {}
         for ticker in symbols:
             try:
-                history = await self._load_history(ticker, start_date, end_date, timeframe)
-                daily = await self._load_daily_context(ticker, start_date, end_date)
+                history = await self.load_history(ticker, start_date, end_date, timeframe)
+                daily = await self.load_daily_context(ticker, start_date, end_date)
             except Exception:
                 logger.exception("walk-forward: failed to load history for {}", ticker)
                 continue
@@ -681,16 +683,16 @@ class BacktestRunner:
                 ))
         return events
 
-    async def _load_daily_context(self, ticker: str, start_date: date, end_date: date) -> list[DailyBar]:
+    async def load_daily_context(self, ticker: str, start_date: date, end_date: date) -> list[DailyBar]:
         """Daily bars for confirmation, from a little before start_date so the
         first signals have a previous completed day to be judged on."""
-        bars = await self._load_history(ticker, start_date - timedelta(days=15), end_date, "daily")
+        bars = await self.load_history(ticker, start_date - timedelta(days=15), end_date, "daily")
         return [
             DailyBar(day=b.timestamp.date(), close=b.close, ema_9=b.ema_9, ema_21=b.ema_21, rsi_14=b.rsi_14)
             for b in bars
         ]
 
-    async def _load_history(
+    async def load_history(
         self, ticker: str, start_date: date, end_date: date, timeframe: Timeframe = "daily",
     ) -> list[HistoryBar]:
         start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)

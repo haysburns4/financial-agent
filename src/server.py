@@ -11,6 +11,7 @@ from src.agui import create_agui_router
 from src.alerts.discord import build_synthesis_context
 from src.backtest import persistence as backtest_persistence
 from src.backtest.calibration import calibrate
+from src.signals.catchup import catch_up
 from src.backtest.runner import BacktestRunner
 from src.config import settings
 from src.db import engine, get_connection, health_check
@@ -39,6 +40,8 @@ class BackfillRequest(BaseModel):
     interval_intraday: str = "5m"
     # Re-run the walk-forward over all stored history and apply it afterwards.
     calibrate: bool = True
+    # Then record the signals missed since the last check (src/signals/catchup.py).
+    catch_up: bool = True
 
 
 class BacktestRequest(BaseModel):
@@ -328,7 +331,15 @@ def create_app() -> FastAPI:
             except Exception as exc:
                 logger.exception("calibration after backfill failed")
                 calibration = {"error": f"{type(exc).__name__}: {exc}"}
-        return {**asdict(result), "calibration": calibration}
+        # After calibration, so caught-up signals carry the fresh confidences.
+        signals: dict | None = None
+        if body.catch_up:
+            try:
+                signals = asdict(await catch_up(engine, tickers))
+            except Exception as exc:
+                logger.exception("signal catch-up after backfill failed")
+                signals = {"error": f"{type(exc).__name__}: {exc}"}
+        return {**asdict(result), "calibration": calibration, "signals": signals}
 
     @app.get("/prices/{ticker}/coverage")
     async def price_coverage(

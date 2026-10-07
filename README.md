@@ -17,8 +17,7 @@ Automated market data collection, technical signal generation, and portfolio mon
 
 ## Getting started
 
-You need Node.js 20+ and E-Trade API keys from [developer.etrade.com](https://developer.etrade.com)
-(sandbox keys work for trying it out). Then:
+You need Node.js 20+ and E-Trade API keys from [developer.etrade.com](https://developer.etrade.com). Then:
 
 ```
 git clone <this repo> && cd financial-agent
@@ -33,19 +32,13 @@ http://127.0.0.1:3000. Ctrl-C stops everything. Later runs skip whatever is alre
 ```
 ./start --dev          # web UI with hot reload (`next dev`) instead of a production build
 ./start --no-browser   # don't open the dashboard
-./start --backfill     # refresh price history and recalibrate signal confidence (`--backfill 5y` the first time)
+./start --backfill     # refresh prices, recalibrate, catch up on missed signals (`--backfill 5y` the first time)
 ./start login          # log in to E-Trade again, against the running app
 ./start setup --all    # change settings (writes .env)
 ./start doctor         # check keys, Node, ports, and shell variables that override .env
 ```
 
-E-Trade ends every session at midnight ET, so log in again once a day: press **Log in to
-E-Trade** in the dashboard (it appears within a minute of the session ending), or run
-`./start login`. Positions refresh every 15 minutes, or immediately via **Refresh** in the
-dashboard. Both servers listen on 127.0.0.1 only.
-
-Settings live in `.env`; `.env.example` lists every one with its default and a one-line
-description. Variables exported in your shell override `.env`.
+Both servers listen on 127.0.0.1. Settings live in `.env`; `.env.example` lists every one with its default. Variables exported in your shell override `.env`.
 
 ### Running without the launcher
 

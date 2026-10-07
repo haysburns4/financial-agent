@@ -7,19 +7,28 @@ Arguments come from the model and are untrusted — every handler normalises
 tickers and clamps limits rather than passing values straight into a query.
 """
 import json
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import and_, distinct, func, select
+from sqlalchemy import Row, and_, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from src.llm import ToolCall, ToolDef, ToolResult
 from src.models import Indicator, Position, PriceBar, Signal
 from src.portfolio import position_dict, risk_by_account
+from src.signals.confirmation import CONFIRMATION_RULES, minus_trading_days, required_trend
 from src.signals.engine import SIGNAL_CATEGORIES, signal_types_for_category
 
 _CATEGORIES = sorted(set(SIGNAL_CATEGORIES.values()))
+# An account overview ranks only this many signals; the rest are counted.
+_TOP_SIGNALS = 10
+_DEFAULT_SIGNAL_DAYS = 2
+# Position alerts (stop-loss, concentration, drawdown) always fire with a
+# fixed confidence, so ranking them against calibrated signals would put them
+# all on top. They are listed on their own instead.
+_ALERT_RULES = frozenset(r for r in CONFIRMATION_RULES if required_trend(r) is None)
 
 TOOLS: tuple[ToolDef, ...] = (
     ToolDef(
@@ -50,8 +59,13 @@ TOOLS: tuple[ToolDef, ...] = (
     ToolDef(
         name="get_signals",
         description=(
-            "Technical signals the engine has fired, newest first, with the rule "
-            "that fired, its direction, calibrated confidence and reasoning."
+            "Signals recorded over the last few trading days, dated by the bar "
+            "they fired on (so this works outside market hours too): the 10 "
+            "highest-confidence entry/exit signals with their rule, direction, "
+            "calibrated confidence and reasoning; a count per rule for the rest; "
+            "and the current position alerts (stop-loss, concentration, "
+            "drawdown), listed separately because their confidence is a fixed "
+            "default, not a calibrated one."
         ),
         parameters={
             "type": "object",
@@ -62,9 +76,9 @@ TOOLS: tuple[ToolDef, ...] = (
                     "enum": _CATEGORIES,
                     "description": "Restrict to entry, exit or risk signals.",
                 },
-                "hours": {
+                "days": {
                     "type": "integer",
-                    "description": "Look-back window in hours (default 24, max 720).",
+                    "description": f"Look-back in trading days (default {_DEFAULT_SIGNAL_DAYS}, max 30).",
                 },
             },
         },
@@ -117,15 +131,15 @@ async def data_summary(conn: AsyncConnection) -> dict:
     """Counts and freshness for the system prompt, so the model knows what exists."""
     positions = await conn.scalar(select(func.count(Position.id))) or 0
     accounts = await conn.scalar(select(func.count(distinct(Position.account_id)))) or 0
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    cutoff = minus_trading_days(datetime.now(timezone.utc), _DEFAULT_SIGNAL_DAYS)
     signals = await conn.scalar(
-        select(func.count(Signal.id)).where(Signal.created_at >= cutoff)
+        select(func.count(Signal.id)).where(Signal.timestamp >= cutoff)
     ) or 0
     latest_bar = await conn.scalar(select(func.max(PriceBar.timestamp)))
     return {
         "positions": positions,
         "accounts": accounts,
-        "signals_24h": signals,
+        "signals_recent": signals,
         "data_freshness_minutes": _age_minutes(latest_bar),
     }
 
@@ -145,33 +159,48 @@ async def _get_portfolio_risk(conn: AsyncConnection, args: dict) -> dict:
     return risk_by_account(rows)
 
 
-async def _get_signals(conn: AsyncConnection, args: dict) -> list[dict]:
-    hours = _clamp(args.get("hours"), default=24, low=1, high=720)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    stmt = (
-        select(Signal)
-        .where(Signal.created_at >= cutoff)
-        .order_by(Signal.created_at.desc())
-        .limit(100)
-    )
+def _signal_dict(r: Row) -> dict:
+    return {
+        "id": r.id,
+        "ticker": r.ticker,
+        "timestamp": r.timestamp,
+        "signal_type": r.signal_type,
+        "category": SIGNAL_CATEGORIES.get(r.signal_type),
+        "direction": r.direction,
+        "confidence": r.confidence,
+        "reasoning": r.reasoning,
+    }
+
+
+async def _get_signals(conn: AsyncConnection, args: dict) -> dict:
+    """An overview that stays short however many signals fired: the top few by
+    confidence, a count per rule, and position alerts on their own."""
+    days = _clamp(args.get("days"), default=_DEFAULT_SIGNAL_DAYS, low=1, high=30)
+    cutoff = minus_trading_days(datetime.now(timezone.utc), days)
+    stmt = select(Signal).where(Signal.timestamp >= cutoff)
     if ticker := _ticker(args.get("ticker")):
         stmt = stmt.where(Signal.ticker == ticker)
     if category := _text(args.get("category")):
         stmt = stmt.where(Signal.signal_type.in_(signal_types_for_category(category)))
+    rows = (await conn.execute(stmt)).all()
 
-    return [
-        {
-            "id": r.id,
-            "ticker": r.ticker,
-            "timestamp": r.timestamp,
-            "signal_type": r.signal_type,
-            "category": SIGNAL_CATEGORIES.get(r.signal_type),
-            "direction": r.direction,
-            "confidence": r.confidence,
-            "reasoning": r.reasoning,
-        }
-        for r in (await conn.execute(stmt)).all()
-    ]
+    ranked = sorted(
+        (r for r in rows if r.signal_type not in _ALERT_RULES),
+        key=lambda r: (r.confidence, r.timestamp),
+        reverse=True,
+    )
+    # Alerts repeat while a position stays down: keep the newest per ticker.
+    alerts: dict[tuple[str, str], Row] = {}
+    for r in sorted((r for r in rows if r.signal_type in _ALERT_RULES), key=lambda r: r.timestamp):
+        alerts[(r.ticker, r.signal_type)] = r
+    return {
+        "since": cutoff,
+        "trading_days": days,
+        "total_signals": len(ranked),
+        "by_type": dict(Counter(r.signal_type for r in ranked).most_common()),
+        "top": [_signal_dict(r) for r in ranked[:_TOP_SIGNALS]],
+        "alerts": [_signal_dict(r) for _, r in sorted(alerts.items())],
+    }
 
 
 async def _get_price_history(conn: AsyncConnection, args: dict) -> dict:

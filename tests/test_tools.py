@@ -1,6 +1,6 @@
 """The agent's tool surface: dispatch, argument coercion, failure handling."""
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import insert
@@ -73,15 +73,65 @@ async def test_get_signals_filters_by_category(engine):
     await _seed(engine)
     _, payload = await _call(engine, "get_signals", {"category": "exit"})
 
-    assert [s["signal_type"] for s in payload] == ["death_cross"]
-    assert payload[0]["category"] == "exit"
+    assert [s["signal_type"] for s in payload["top"]] == ["death_cross"]
+    assert payload["top"][0]["category"] == "exit"
 
 
 async def test_lowercase_tickers_are_normalised(engine):
     await _seed(engine)
     _, payload = await _call(engine, "get_signals", {"ticker": "aapl"})
 
-    assert [s["ticker"] for s in payload] == ["AAPL"]
+    assert [s["ticker"] for s in payload["top"]] == ["AAPL"]
+
+
+def _signal(ticker, signal_type, confidence, ts):
+    return {"ticker": ticker, "timestamp": ts, "signal_type": signal_type, "direction": None,
+            "confidence": confidence, "reasoning": "r", "delivered": True}
+
+
+async def test_overview_ranks_the_top_ten_and_counts_the_rest(engine):
+    now = datetime.now(timezone.utc)
+    rows = [_signal(f"T{i:02d}", "breakout", 0.30 + i / 100, now - timedelta(minutes=i)) for i in range(15)]
+    rows.append(_signal("OLD", "breakout", 0.99, now - timedelta(days=9)))  # outside the window
+    async with engine.begin() as conn:
+        await conn.execute(insert(Signal), rows)
+
+    _, payload = await _call(engine, "get_signals")
+
+    assert payload["total_signals"] == 15
+    assert payload["by_type"] == {"breakout": 15}
+    assert [s["ticker"] for s in payload["top"]] == [f"T{i:02d}" for i in range(14, 4, -1)]
+
+
+async def test_position_alerts_are_listed_apart_not_ranked(engine):
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as conn:
+        await conn.execute(insert(Signal), [
+            _signal("AXP", "stop_loss_warning", 0.75, now - timedelta(hours=5)),
+            _signal("AXP", "stop_loss_warning", 0.75, now - timedelta(hours=1)),  # repeat: newest kept
+            _signal("BAM", "stop_loss_warning", 0.75, now),
+            _signal("NVDA", "golden_cross", 0.41, now),
+        ])
+
+    _, payload = await _call(engine, "get_signals")
+
+    assert [s["ticker"] for s in payload["top"]] == ["NVDA"]
+    assert [(s["ticker"], s["signal_type"]) for s in payload["alerts"]] == [
+        ("AXP", "stop_loss_warning"), ("BAM", "stop_loss_warning"),
+    ]
+    assert payload["total_signals"] == 1
+
+
+async def test_signals_are_dated_by_when_they_fired_not_when_recorded(engine):
+    # A catch-up writes old signals now; the window follows the bar's time.
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as conn:
+        await conn.execute(insert(Signal), [_signal("AAPL", "breakout", 0.4, now - timedelta(days=12))])
+
+    _, payload = await _call(engine, "get_signals")
+    assert payload["total_signals"] == 0
+    _, wide = await _call(engine, "get_signals", {"days": 30})
+    assert wide["total_signals"] == 1
 
 
 async def test_price_history_requires_a_ticker(engine):
@@ -131,7 +181,7 @@ async def test_data_summary_on_an_empty_database(engine):
     assert summary == {
         "positions": 0,
         "accounts": 0,
-        "signals_24h": 0,
+        "signals_recent": 0,
         "data_freshness_minutes": -1,
     }
 
@@ -143,7 +193,7 @@ async def test_data_summary_counts_accounts_not_positions(engine):
 
     assert summary["positions"] == 2
     assert summary["accounts"] == 2
-    assert summary["signals_24h"] == 2
+    assert summary["signals_recent"] == 2
 
 
 def test_every_tool_has_a_handler():

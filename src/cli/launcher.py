@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -68,6 +69,14 @@ class _Calibration(BaseModel):
     error: str | None = None
 
 
+class _CatchUp(BaseModel):
+    since: datetime | None = None
+    recorded: dict[str, int] = {}
+    filtered: int = 0
+    duplicates: int = 0
+    error: str | None = None
+
+
 class _BackfillResult(BaseModel):
     tickers_processed: int
     daily_bars_added: int
@@ -75,6 +84,7 @@ class _BackfillResult(BaseModel):
     errors: list[str]
     duration_seconds: float
     calibration: _Calibration | None = None
+    signals: _CatchUp | None = None
 
 
 _PORTFOLIO_RULES = ("stop_loss_warning", "concentration_risk", "drawdown_alert")
@@ -99,6 +109,19 @@ def calibration_summary(cal: _Calibration) -> str:
     if kept:
         parts.append(f"unchanged (too little evidence): {', '.join(kept)}")
     return "[calibrate] " + "; ".join(parts)
+
+
+def catch_up_summary(result: _CatchUp) -> str:
+    """One line for the terminal: signals recorded by the post-backfill catch-up."""
+    if result.error:
+        return f"[signals] catch-up failed: {result.error}"
+    since = f" since {result.since.astimezone().strftime('%a %b %d %H:%M')}" if result.since else ""
+    total = sum(result.recorded.values())
+    by_rule = ", ".join(f"{rule} {n}" for rule, n in sorted(result.recorded.items(), key=lambda kv: -kv[1]))
+    return (
+        f"[signals] caught up{since}: {total} recorded" + (f" ({by_rule})" if by_rule else "")
+        + f", {result.filtered} filtered by daily trend"
+    )
 
 
 def _files(directory: Path) -> Iterator[Path]:
@@ -354,6 +377,8 @@ class Launcher:
             )
             if result.calibration is not None:
                 self.supervisor.say(calibration_summary(result.calibration))
+            if result.signals is not None:
+                self.supervisor.say(catch_up_summary(result.signals))
 
         thread = threading.Thread(target=run, name="backfill", daemon=True)
         thread.start()

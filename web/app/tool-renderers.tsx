@@ -165,43 +165,77 @@ const risk = defineToolCallRenderer({
 
 // ---------- get_signals ----------
 
-const signalsResult = z.array(
-  z.object({
-    id: z.number(),
-    ticker: z.string(),
-    signal_type: z.string(),
-    direction: z.string().nullable(),
-    confidence: z.number().nullable(),
-  }),
-);
+const signalRow = z.object({
+  id: z.number(),
+  ticker: z.string(),
+  signal_type: z.string(),
+  direction: z.string().nullable(),
+  confidence: z.number().nullable(),
+  reasoning: z.string(),
+});
+
+// src/agent/tools.py _get_signals: the top few by confidence, a count for the
+// rest, and position alerts (fixed confidence, so not ranked) on their own.
+const signalsResult = z.object({
+  trading_days: z.number(),
+  total_signals: z.number(),
+  top: z.array(signalRow),
+  alerts: z.array(signalRow),
+});
+
+function ruleName(signalType: string): string {
+  return signalType.replaceAll("_", " ");
+}
 
 const signals = defineToolCallRenderer({
   name: "get_signals",
-  args: z.object({ ticker: z.string().optional(), category: z.string().optional(), hours: z.number().optional() }),
+  args: z.object({ ticker: z.string().optional(), category: z.string().optional(), days: z.number().optional() }),
   render: function Signals({ args, result }) {
-    const rows = result === undefined ? null : parseJson(result, signalsResult);
-    const scope = [args.ticker, args.category, `last ${args.hours ?? 24}h`].filter(Boolean).join(" · ");
-    const summary = rows && `${plural(rows.length, "signal")} · ${scope}`;
+    const data = result === undefined ? null : parseJson(result, signalsResult);
+    const shown = data ? (data.top.length < data.total_signals ? `top ${data.top.length} of ${data.total_signals}` : `${data.total_signals}`) : "";
+    const summary =
+      data &&
+      [
+        `${shown} signal${data.total_signals === 1 ? "" : "s"}`,
+        data.alerts.length ? plural(data.alerts.length, "position alert") : null,
+        [args.ticker, args.category].filter(Boolean).join(" ") || null,
+        `last ${plural(data.trading_days, "trading day")}`,
+      ]
+        .filter(Boolean)
+        .join(" · ");
     return (
       <ToolCard label="Signals" result={result} summary={summary}>
-        {rows && rows.length === 0 && <p className="more">None in this window.</p>}
-        {rows && rows.length > 0 && (
+        {data && data.top.length === 0 && data.alerts.length === 0 && <p className="more">None in this window.</p>}
+        {data && data.top.length > 0 && (
           <table>
             <tbody>
-              {rows.slice(0, ROWS).map((s) => (
+              {data.top.map((s) => (
                 <tr key={s.id}>
                   <td className="t">{s.ticker}</td>
-                  <td className="muted">{s.signal_type.replaceAll("_", " ")}</td>
-                  <td className={s.direction === "long" ? "gain" : "muted"}>
-                    {s.direction ?? "—"}
-                  </td>
+                  <td className="muted">{ruleName(s.signal_type)}</td>
+                  <td className={s.direction === "long" ? "gain" : "muted"}>{s.direction ?? "—"}</td>
                   <td>{s.confidence === null ? "—" : pct.format(s.confidence)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         )}
-        {rows && rows.length > ROWS && <p className="more">+{rows.length - ROWS} more</p>}
+        {data && data.alerts.length > 0 && (
+          <>
+            <p className="more">Position alerts</p>
+            <table>
+              <tbody>
+                {data.alerts.map((s) => (
+                  <tr key={s.id}>
+                    <td className="t">{s.ticker}</td>
+                    <td className="muted">{ruleName(s.signal_type)}</td>
+                    <td>{s.reasoning.split(" (")[0]}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
+        )}
       </ToolCard>
     );
   },

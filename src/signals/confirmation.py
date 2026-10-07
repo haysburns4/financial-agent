@@ -60,6 +60,15 @@ def trading_days_between(earlier: date, later: date) -> int:
     return days
 
 
+def minus_trading_days(ts: datetime, days: int) -> datetime:
+    """`ts` moved back `days` weekdays, same time of day (holidays ignored)."""
+    while days > 0:
+        ts -= timedelta(days=1)
+        if ts.weekday() < 5:
+            days -= 1
+    return ts
+
+
 def classify_trend(ema_9: float | None, ema_21: float | None, close: float | None) -> Trend:
     if ema_9 is None or ema_21 is None or close is None:
         return "unknown"

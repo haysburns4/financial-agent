@@ -196,7 +196,7 @@ def _format_facts(summary: dict) -> str:
     lines = [
         f"- Watchlist: {', '.join(settings.WATCHLIST)}",
         f"- {summary['positions']} positions across {summary['accounts']} account(s)",
-        f"- {summary['signals_24h']} signal(s) fired in the last 24h",
+        f"- {summary['signals_recent']} signal(s) in the last 2 trading days",
     ]
     lines.append(
         "- No price bars stored yet; a backfill has not been run"

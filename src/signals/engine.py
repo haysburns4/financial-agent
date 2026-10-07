@@ -142,7 +142,7 @@ class SignalCandidate:
     confidence: float
     reasoning: str
 
-    def to_row(self) -> dict:
+    def to_row(self, delivered: bool = False) -> dict:
         return {
             "ticker": self.ticker,
             "timestamp": self.timestamp,
@@ -150,7 +150,7 @@ class SignalCandidate:
             "direction": self.direction,
             "confidence": self.confidence,
             "reasoning": self.reasoning,
-            "delivered": False,
+            "delivered": delivered,
         }
 
 
@@ -249,27 +249,12 @@ class SignalEngine:
                             continue
                         emitted_portfolio.add(c.signal_type)
 
-                    if await self._is_duplicate(conn, c):
-                        logger.debug(
-                            "dedup'd recent {} for {} (within {})",
-                            c.signal_type,
-                            c.ticker,
-                            self.DEDUP_WINDOW,
-                        )
+                    sig_id = await self.record(conn, c)
+                    if sig_id is None:
                         continue
-
-                    res = await conn.execute(insert(Signal).values(**c.to_row()))
-                    sig_id = res.inserted_primary_key[0]
                     if decision is not Decision.NOT_REQUIRED:
                         self._stats.record(c.signal_type, fired=True)
                     inserted.append({**asdict(c), "id": sig_id})
-                    logger.info(
-                        "signal: {} {} ({:.2f}) — {}",
-                        c.ticker,
-                        c.signal_type,
-                        c.confidence,
-                        c.reasoning,
-                    )
 
         logger.info("signal engine: {} new signal(s) across {} ticker(s)", len(inserted), len(tickers))
         return inserted
@@ -534,10 +519,34 @@ class SignalEngine:
             for r in rows
         ]
 
+    async def record(
+        self, conn: AsyncConnection, candidate: SignalCandidate, delivered: bool = False
+    ) -> int | None:
+        """Insert a confirmed candidate unless it duplicates one already recorded.
+
+        Shared by the live run and the post-backfill catch-up
+        (src/signals/catchup.py). Returns the new id, or None if deduplicated.
+        """
+        if await self._is_duplicate(conn, candidate):
+            logger.debug(
+                "dedup'd {} for {} (another within {} of {})",
+                candidate.signal_type, candidate.ticker, self.DEDUP_WINDOW, candidate.timestamp,
+            )
+            return None
+        res = await conn.execute(insert(Signal).values(**candidate.to_row(delivered=delivered)))
+        logger.info(
+            "signal: {} {} ({:.2f}) — {}",
+            candidate.ticker, candidate.signal_type, candidate.confidence, candidate.reasoning,
+        )
+        return res.inserted_primary_key[0]
+
     async def _is_duplicate(
         self, conn: AsyncConnection, candidate: SignalCandidate
     ) -> bool:
-        cutoff = datetime.now(timezone.utc) - self.DEDUP_WINDOW
+        # By when the signal happened, not when the row was written: a
+        # catch-up records days of signals at once, and those must only be
+        # deduplicated against signals near their own time.
+        window = (candidate.timestamp - self.DEDUP_WINDOW, candidate.timestamp + self.DEDUP_WINDOW)
         direction_filter = (
             Signal.direction.is_(None)
             if candidate.direction is None
@@ -549,7 +558,8 @@ class SignalEngine:
                 Signal.ticker == candidate.ticker,
                 Signal.signal_type == candidate.signal_type,
                 direction_filter,
-                Signal.created_at >= cutoff,
+                Signal.timestamp > window[0],
+                Signal.timestamp < window[1],
             )
             .limit(1)
         )
