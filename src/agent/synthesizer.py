@@ -23,7 +23,9 @@ _SYSTEM_PROMPT = (
 
 
 class SignalSynthesizer:
-    MAX_TOKENS = 1024
+    # The briefing is ~200 words, but reasoning models spend hidden reasoning
+    # tokens from this same budget; too low and they return an empty briefing.
+    MAX_TOKENS = 8_000
 
     def __init__(self, backend: LLMBackend) -> None:
         self._backend = backend

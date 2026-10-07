@@ -215,31 +215,125 @@ html, body {
   max-width: calc(100% - 20px);
 }
 
-.toolcard {
+/* ---------- chat (CopilotKit v2, re-themed) ---------- */
+
+/* CopilotKit styles itself from shadcn-style tokens on [data-copilotkit];
+   point them at the dashboard palette. `.chat` also carries `dark`, which
+   switches on CopilotKit's dark-mode utilities.
+   Literal colours, not var(--muted) etc.: CopilotKit reuses those names with
+   other meanings (--muted is a background there), and `--border: var(--border)`
+   would refer to itself. Inside the chat, use CopilotKit's names. */
+.chat [data-copilotkit] {
+  --background: #0f1115;
+  --foreground: #e6e9ef;
+  --card: #161a21;
+  --card-foreground: #e6e9ef;
+  --popover: #161a21;
+  --popover-foreground: #e6e9ef;
+  --primary: #5b9dff;
+  --primary-foreground: #0b0d11;
+  --secondary: #1c212a;
+  --secondary-foreground: #e6e9ef;
+  --muted: #161a21;
+  --muted-foreground: #8b95a7;
+  --accent: #1c212a;
+  --accent-foreground: #e6e9ef;
+  --border: #252b35;
+  --input: #252b35;
+  --ring: #5b9dff;
+  --radius: 0.5rem;
+  font-family: inherit;
+  font-size: 14px;
+  background: var(--background);
+  color: var(--foreground);
+}
+
+/* Welcome heading and input: sized like the rest of the dashboard. CopilotKit
+   hard-codes these (a #303030 pill, 16px text), so they need direct overrides. */
+.chat [data-testid="copilot-welcome-screen"] h1 { font-size: 18px; font-weight: 600; }
+.chat [data-testid="copilot-chat-input"] {
+  background: var(--card);
   border: 1px solid var(--border);
-  background: var(--panel);
+  border-radius: 12px;
+  box-shadow: none;
+}
+.chat [data-testid="copilot-chat-input"]:focus-within { border-color: #3a4352; }
+.chat [data-testid="copilot-chat-textarea"] { font-size: 14px; }
+.chat [data-testid="copilot-chat-textarea"]::placeholder { color: var(--muted-foreground); }
+
+/* Tool calls: one quiet line each, expandable into a small table. */
+.tool {
+  margin: 4px 0;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 8px 12px;
-  margin: 6px 0;
-  font-size: 13px;
+  background: var(--card);
+  font-size: 12px;
+  color: var(--foreground);
 }
-.toolcard .row { display: flex; align-items: center; gap: 8px; }
-.toolcard .dot {
-  width: 7px; height: 7px; border-radius: 50%;
-  background: var(--accent);
+.tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  min-width: 0;
+  list-style: none;
 }
-.toolcard .dot.done { background: #3fb950; }
-.toolcard .args { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; }
-.toolcard details { margin-top: 6px; }
-.toolcard summary { color: var(--muted); cursor: pointer; font-size: 12px; }
-.toolcard pre {
+details.tool > summary { cursor: pointer; }
+details.tool > summary::-webkit-details-marker { display: none; }
+details.tool > summary::after {
+  content: "▸";
+  margin-left: auto;
+  color: var(--muted-foreground);
+  transition: transform 0.15s;
+}
+details.tool[open] > summary::after { transform: rotate(90deg); }
+details.tool > summary:hover { background: #1a1f27; border-radius: 8px; }
+.tool-label { font-weight: 600; white-space: nowrap; }
+.tool-summary {
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tool-state {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--gain);
+}
+.tool-state.running { background: var(--primary); animation: tool-pulse 1s ease-in-out infinite; }
+.tool-state.error { background: var(--warn); }
+@keyframes tool-pulse { 50% { opacity: 0.3; } }
+@media (prefers-reduced-motion: reduce) { .tool-state.running { animation: none; } }
+
+.tool-body { padding: 2px 10px 8px; border-top: 1px solid #1c212a; }
+.tool-body table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.tool-body td { padding: 3px 0; text-align: right; white-space: nowrap; }
+.tool-body td:first-child { text-align: left; }
+.tool-body td + td { padding-left: 12px; }
+.tool-body .t { font-weight: 600; }
+.tool-body .muted, .tool-body .more { color: var(--muted-foreground); }
+.tool-body .gain { color: var(--gain); }
+.tool-body .more { margin: 4px 0 0; }
+.tool-body .bar-cell { width: 45%; }
+.tool-body .bar {
+  display: block;
+  height: 4px;
+  margin-left: auto;
+  border-radius: 2px;
+  background: var(--primary);
+  opacity: 0.6;
+}
+.tool-raw {
   margin: 6px 0 0;
-  padding: 8px;
-  background: #0b0d11;
-  border-radius: 6px;
-  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
   font-size: 11px;
-  max-height: 240px;
+  color: var(--muted-foreground);
+  max-height: 160px;
+  overflow-y: auto;
 }
 
 .banner {
@@ -301,3 +395,45 @@ button.pill.login[aria-expanded="true"] { border-color: var(--warn); background:
 }
 .etrade-login button.link:hover { color: var(--text); }
 .etrade-login .login-error .hint { display: block; margin-top: 4px; color: var(--muted); }
+
+/* Attachments go nowhere: the backend reads only the text of each turn. */
+.chat [data-testid="copilot-add-menu-button"] { display: none; }
+
+/* Messages at the dashboard's reading size. CopilotKit's markdown (Streamdown,
+   prose) is sized for a full-page chat; its spacing is in em, so it scales too. */
+.chat [data-testid="copilot-user-message"],
+.chat [data-testid="copilot-user-message"] *,
+.chat [data-testid="copilot-assistant-message"] :is(p, li, td, th, blockquote) {
+  font-size: 14px;
+  line-height: 1.55;
+}
+.chat [data-testid="copilot-assistant-message"] :is(h1, h2, h3, h4) {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 1em 0 0.35em;
+}
+.chat [data-testid="copilot-assistant-message"] :is(ul, ol) { margin: 0.35em 0; padding-left: 1.2em; }
+.chat [data-testid="copilot-assistant-message"] li { margin: 0.15em 0; }
+.chat [data-testid="copilot-assistant-message"] p { margin: 0.5em 0; }
+.chat [data-testid="copilot-assistant-message"] strong { color: #fff; }
+
+/* Send is the accent blue; while a run streams it becomes a quiet stop button. */
+.chat [data-testid="copilot-send-button"] {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.chat [data-testid="copilot-send-button"]:disabled { background: var(--secondary); color: var(--muted-foreground); }
+.chat [data-testid="copilot-send-button"]:has(.lucide-square) {
+  background: var(--secondary);
+  color: var(--foreground);
+}
+
+/* "Thinking" indicator: tinted and pulsing so a long reasoning turn reads as work. */
+.chat [data-testid="copilot-loading-cursor"] {
+  background: var(--primary);
+  animation: tool-pulse 1s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat [data-testid="copilot-loading-cursor"] { animation: none; }
+}
+.chat [data-testid="copilot-assistant-message"] li > p { margin: 0; }

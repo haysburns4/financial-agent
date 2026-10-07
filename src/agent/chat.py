@@ -37,7 +37,8 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "Never give direct buy/sell advice. If asked for something the tools cannot "
     "reach (real-time quotes, news, fundamentals, predictions), say so clearly and "
     "offer what you can answer instead. Be concise, and reference specific tickers, "
-    "positions and signals by name."
+    "positions and signals by name. Refer to an account by the last four digits "
+    "of its number (e.g. ••9991), as the dashboard does; never write it in full."
 )
 
 _STALE_AUTH_NOTE = (
@@ -46,8 +47,21 @@ _STALE_AUTH_NOTE = (
 )
 
 
+_CUT_OFF_NOTE = (
+    "\n\n_(The answer was cut off: the model reached its output limit. "
+    "Try a narrower question.)_"
+)
+_TOOL_CEILING_NOTE = (
+    "\n\n_(Stopped after {n} rounds of looking things up without an answer. "
+    "Try a narrower question.)_"
+)
+
+
 class AgentChat:
-    MAX_TOKENS = 2048
+    # Output budget per model turn. Reasoning models (gpt-5, Opus 5's adaptive
+    # thinking) spend hidden reasoning tokens from this same budget, so at 2048
+    # they could think through it entirely and return no text at all.
+    MAX_TOKENS = 16_000
     MAX_HISTORY_TURNS = 10
     # Ceiling on model -> tools -> model round trips within a single question.
     MAX_TOOL_ITERATIONS = 5
@@ -142,6 +156,10 @@ class AgentChat:
             if final is None or final.stop_reason != "tool_use":
                 if final is not None and final.stop_reason == "refusal":
                     logger.warning("chat: provider refused the request")
+                if final is not None and final.stop_reason == "max_tokens":
+                    # Otherwise the user sees the tool cards and then nothing.
+                    logger.warning("chat: answer cut off at {} output tokens", self.MAX_TOKENS)
+                    yield TextDelta(_CUT_OFF_NOTE)
                 return
 
             messages.append(final.message)
@@ -155,6 +173,7 @@ class AgentChat:
         logger.warning(
             "chat: stopped at the {}-iteration tool ceiling", self.MAX_TOOL_ITERATIONS
         )
+        yield TextDelta(_TOOL_CEILING_NOTE.format(n=self.MAX_TOOL_ITERATIONS))
 
     def _build_messages(
         self,

@@ -5,7 +5,7 @@ from sqlalchemy import insert
 
 from src.agent.chat import AgentChat
 from src.agent.synthesizer import SignalSynthesizer
-from src.llm import Message, MessageComplete, TextDelta
+from src.llm import Message, MessageComplete, TextDelta, Usage
 from src.models import Position
 
 from tests.conftest import FakeBackend, text_reply, tool_reply
@@ -36,6 +36,29 @@ async def test_ask_sends_the_question_as_the_final_turn(engine, backend):
     call = backend.calls[0]
     assert call["messages"][-1] == Message(role="user", text="Why is NVDA down?")
     assert call["max_tokens"] == AgentChat.MAX_TOKENS
+
+
+async def test_an_answer_cut_off_by_the_output_limit_says_so(engine):
+    # What gpt-5 did at a 2048-token budget: all reasoning, no visible text.
+    silent = [
+        MessageComplete(
+            message=Message(role="assistant", text=""),
+            stop_reason="max_tokens",
+            usage=Usage(input_tokens=7000, output_tokens=AgentChat.MAX_TOKENS),
+        )
+    ]
+    backend = FakeBackend([tool_reply("get_positions", {}), silent])
+
+    result = await AgentChat(engine, backend).ask("Analyze my allocation")
+
+    assert "cut off" in result["answer"]
+
+
+async def test_hitting_the_tool_ceiling_says_so(engine):
+    turns = [tool_reply("get_positions", {}, call_id=f"c{i}") for i in range(AgentChat.MAX_TOOL_ITERATIONS)]
+    result = await AgentChat(engine, FakeBackend(turns)).ask("Loop forever")
+
+    assert "Stopped after" in result["answer"]
 
 
 async def test_ask_replays_history_as_neutral_turns(engine, backend):
