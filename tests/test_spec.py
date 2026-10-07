@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic_core import PydanticUndefined
 
-from src.cli.spec import EXAMPLE_PATH, SPEC, Always, WhenEquals, is_required, render_example
+from src.cli.spec import BY_NAME, EXAMPLE_PATH, SPEC, Always, WhenEquals, is_required, problem, render_example
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -88,7 +88,9 @@ def test_example_holds_no_secret_values():
 def test_cli_package_does_not_import_config():
     # A fresh interpreter with no E-Trade keys: importing src.config there would raise.
     code = (
-        "import sys, src.cli.spec, src.cli.env_file\n"
+        "import sys\n"
+        "import src.cli.__main__, src.cli.checks, src.cli.doctor, src.cli.env_file\n"
+        "import src.cli.spec, src.cli.ui, src.cli.wizard\n"
         "assert 'src.config' not in sys.modules, 'src.cli imported src.config'\n"
     )
     env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(ROOT)}
@@ -96,3 +98,28 @@ def test_cli_package_does_not_import_config():
         [sys.executable, "-c", code], cwd=ROOT / "tests", env=env, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "expected"),
+    [
+        ("ETRADE_CONSUMER_KEY", "", "ETRADE_CONSUMER_KEY is not set"),
+        ("ETRADE_CONSUMER_KEY", "has space", "ETRADE_CONSUMER_KEY must be a single word with no spaces"),
+        ("ETRADE_SANDBOX", "maybe", "ETRADE_SANDBOX must be true or false"),
+        ("ETRADE_SANDBOX", "False", None),
+        ("PRICE_POLL_MINUTES", "0", "PRICE_POLL_MINUTES must be between 1 and 1440"),
+        ("PRICE_POLL_MINUTES", "", "PRICE_POLL_MINUTES must be a whole number"),
+        ("WATCHLIST", "AAPL,BRK.B", None),
+        ("WATCHLIST", " , ", "WATCHLIST must list at least one ticker"),
+        ("LLM_PROVIDER", "gemini", "LLM_PROVIDER must be one of: anthropic, openai"),
+        ("DISCORD_WEBHOOK_URL", "", None),
+        ("DISCORD_WEBHOOK_URL", "http://x", "DISCORD_WEBHOOK_URL must be an https:// URL"),
+        ("TOKEN_ENCRYPTION_KEY", "not-a-key", "TOKEN_ENCRYPTION_KEY is not a valid Fernet key"),
+    ],
+)
+def test_problem(name, value, expected):
+    assert problem(BY_NAME[name], {name: value}) == expected
+
+
+def test_absent_optional_setting_uses_its_default():
+    assert problem(BY_NAME["LOG_LEVEL"], {}) is None
