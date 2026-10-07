@@ -1,6 +1,5 @@
 """Walk-forward validation, the two-tier confidence config and calibration."""
 import json
-import runpy
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
@@ -9,17 +8,19 @@ import pytest
 from sqlalchemy import insert
 
 from src.backtest import confidence_config
-from src.backtest.persistence import CalibrationStore, render_config
+from src.backtest.persistence import CalibrationStore
 from src.backtest.runner import BacktestRunner, _Tally, summarize_windows, walkforward_windows
 from src.models import Indicator, PriceBar
 from src.signals import engine as signal_engine
 
 # ---------- synthetic history ----------
 #
-# Business days 2024-01-01 .. 2025-12-31. EMA-9 sits below EMA-21 except on
-# chosen "cross days", where it pokes above: a golden cross on that bar (and a
-# death cross the bar after, which these tests ignore). The close five bars
-# later decides the outcome: 103 is a win for an entry rule, 97 a loss.
+# Business days 2024-01-01 .. 2025-12-31 in a steady daily uptrend (EMA-9 3 >
+# EMA-21 2, close 100 above both), so confirmation lets long entries through.
+# On chosen "event days" the close pokes above the 20-day high (100) on double
+# volume: a breakout. The close five bars later decides the outcome: 103 is a
+# win for an entry rule, 97 a loss. Highs stay at 100 so later bars never
+# break out on their own.
 
 START, END = date(2024, 1, 1), date(2026, 1, 1)
 
@@ -33,7 +34,7 @@ def _business_days(first: date, last: date) -> list[date]:
     return days
 
 
-def _cross_days(days: list[date]) -> list[date]:
+def _event_days(days: list[date]) -> list[date]:
     """Two per month, ~2 weeks apart, so forward windows never overlap."""
     out = []
     for year, month in {(d.year, d.month) for d in days}:
@@ -46,22 +47,21 @@ def _midnight(d: date) -> datetime:
     return datetime.combine(d, time(0), tzinfo=timezone.utc)
 
 
-async def _seed(engine, ticker: str, days: list[date], wins: dict[date, bool]) -> None:
-    """One ticker's bars + indicators; `wins` maps cross days to their outcome."""
+async def _seed(engine, ticker: str, days: list[date], wins: dict[date, bool], ema_9: float = 3.0) -> None:
+    """One ticker's daily bars + indicators; `wins` maps event days to outcomes."""
     index = {d: i for i, d in enumerate(days)}
     close = {d: 100.0 for d in days}
-    for cross, win in wins.items():
-        close[days[index[cross] + 5]] = 103.0 if win else 97.0
+    volume = {d: 1000.0 for d in days}
+    for event, win in wins.items():
+        close[event], volume[event] = 101.0, 2000.0
+        close[days[index[event] + 5]] = 103.0 if win else 97.0
     bars, indicators = [], []
     for d in days:
         bars.append({
-            "ticker": ticker, "timestamp": _midnight(d), "open": close[d], "high": close[d],
-            "low": close[d], "close": close[d], "volume": 1000.0, "adjusted_close": close[d],
+            "ticker": ticker, "timestamp": _midnight(d), "open": 100.0, "high": 100.0,
+            "low": 97.0, "close": close[d], "volume": volume[d], "adjusted_close": close[d],
         })
-        indicators.append({
-            "ticker": ticker, "timestamp": _midnight(d),
-            "ema_9": 3.0 if d in wins else 1.0, "ema_21": 2.0,
-        })
+        indicators.append({"ticker": ticker, "timestamp": _midnight(d), "ema_9": ema_9, "ema_21": 2.0})
     async with engine.begin() as conn:
         await conn.execute(insert(PriceBar), bars)
         await conn.execute(insert(Indicator), indicators)
@@ -70,30 +70,29 @@ async def _seed(engine, ticker: str, days: list[date], wins: dict[date, bool]) -
 @pytest.fixture
 async def history(engine):
     days = _business_days(START, END - timedelta(days=1))
-    crosses = _cross_days(days)
-    in_2025 = [d for d in crosses if d.year == 2025]
+    events = _event_days(days)
 
-    # STBL: in every 2025 month, one cross wins and one loses -> 50% each window.
-    stable = {d: i % 2 == 0 for i, d in enumerate(crosses)}
+    # STBL: in every 2025 month, one breakout wins and one loses -> 50% each window.
+    await _seed(engine, "STBL", days, {d: i % 2 == 0 for i, d in enumerate(events)})
     # SWNG: whole months right, then whole months wrong -> 100%, 0%, 100%, ...
-    swing = {d: d.month % 2 == 1 for d in crosses}
-    await _seed(engine, "STBL", days, stable)
-    await _seed(engine, "SWNG", days, swing)
+    await _seed(engine, "SWNG", days, {d: d.month % 2 == 1 for d in events})
+    # FLAT: same breakouts, but EMA-9 below EMA-21: the daily trend is flat, so
+    # confirmation (which wants an uptrend for a long entry) filters every one.
+    await _seed(engine, "FLAT", days, {d: True for d in events}, ema_9=1.0)
 
     # LATE: history from July 2024, always right; only the windows whose train
     # period it covers (train_start >= Jul 2024: tests Jul-Dec 2025) count.
     late_days = [d for d in days if d >= date(2024, 7, 1)]
-    await _seed(engine, "LATE", late_days, {d: True for d in crosses if d >= date(2024, 7, 1)})
+    await _seed(engine, "LATE", late_days, {d: True for d in events if d >= date(2024, 7, 1)})
 
-    # A 5-minute bar with a cross on it: daily-only replay must not see it.
+    # A 5-minute bar that would be a breakout: the daily replay must not see it.
     stray = datetime(2025, 3, 20, 14, 30, tzinfo=timezone.utc)
     async with engine.begin() as conn:
         await conn.execute(insert(PriceBar), [{
             "ticker": "STBL", "timestamp": stray, "open": 100.0, "high": 100.0, "low": 100.0,
-            "close": 100.0, "volume": 1000.0, "adjusted_close": 100.0,
+            "close": 200.0, "volume": 9000.0, "adjusted_close": 200.0,
         }])
         await conn.execute(insert(Indicator), [{"ticker": "STBL", "timestamp": stray, "ema_9": 3.0, "ema_21": 2.0}])
-    return in_2025
 
 
 # ---------- windows ----------
@@ -197,38 +196,61 @@ async def test_walkforward_measures_only_out_of_sample_windows(engine, history):
 
     assert len(report.windows) == 12
     assert report.tickers == ["STBL", "SWNG", "LATE"]
-    golden = _rule(report, "golden_cross")
+    assert report.timeframe == "daily"
+    breakout = _rule(report, "breakout")
 
-    stable = golden.by_ticker["STBL"]
-    # 2025 crosses only (2024 is train-only), and not the stray 5-minute bar.
+    stable = breakout.by_ticker["STBL"]
+    # 2025 events only (2024 is train-only), and not the stray 5-minute bar.
     assert stable.total_occurrences == 24
     assert stable.window_hit_rates == [0.5] * 12
     assert stable.stability_score == 1
     assert stable.suggested_confidence == pytest.approx(0.5)
 
-    swing = golden.by_ticker["SWNG"]
+    swing = breakout.by_ticker["SWNG"]
     assert swing.window_hit_rates == [1.0, 0.0] * 6
     assert swing.aggregate_hit_rate == pytest.approx(0.5)
     assert swing.stability_score == 0
     assert swing.suggested_confidence == pytest.approx(0.35)
 
-    late = golden.by_ticker["LATE"]
-    assert late.windows_evaluated == 6  # Jul-Dec 2025; its Jan-Jun crosses lack a full train window
+    late = breakout.by_ticker["LATE"]
+    assert late.windows_evaluated == 6  # Jul-Dec 2025; its Jan-Jun events lack a full train window
     assert late.total_evaluated == 12
     assert late.suggested_confidence == 0.95
 
-    assert golden.total_evaluated == 24 + 24 + 12
-    assert golden.windows_evaluated == 12
+    assert breakout.total_evaluated == 24 + 24 + 12
+    assert breakout.windows_evaluated == 12
     assert _rule(report, "concentration_risk").total_evaluated == 0
 
 
-async def test_single_window_backtest_reports_by_ticker_and_ignores_intraday(engine, history):
-    report = await BacktestRunner(engine).run(["STBL", "SWNG"], START, END)
-    golden = _rule(report, "golden_cross")
+async def test_walkforward_applies_daily_trend_confirmation(engine, history):
+    report = await BacktestRunner(engine).run_walkforward(["FLAT"], START, END)
+    flat = _rule(report, "breakout")
 
-    assert set(golden.by_ticker) == {"STBL", "SWNG"}
-    assert golden.by_ticker["STBL"].occurrences == 48  # 2 a month for 24 months, no stray
-    assert golden.by_ticker["STBL"].hit_rate == pytest.approx(0.5)
+    assert flat.total_occurrences == 0
+    assert flat.total_filtered == 24
+    assert flat.aggregate_hit_rate is None
+    assert flat.by_ticker["FLAT"].total_filtered == 24
+
+
+async def test_single_window_backtest_reports_by_ticker_and_ignores_intraday(engine, history):
+    report = await BacktestRunner(engine).run(["STBL", "SWNG", "FLAT"], START, END)
+    breakout = _rule(report, "breakout")
+
+    assert set(breakout.by_ticker) == {"STBL", "SWNG", "FLAT"}
+    # 2 a month for 24 months, minus January 2024's two (fewer than 20 bars of
+    # lookback yet), and no stray 5-minute breakout.
+    assert breakout.by_ticker["STBL"].occurrences == 46
+    assert breakout.by_ticker["STBL"].hit_rate == pytest.approx(0.5)
+    assert breakout.by_ticker["FLAT"].occurrences == 0
+    assert breakout.by_ticker["FLAT"].filtered == 46
+    assert breakout.filtered == 46
+
+
+async def test_intraday_timeframe_reads_only_the_5_minute_bars(engine, history):
+    report = await BacktestRunner(engine).run(["STBL"], START, END, timeframe="intraday")
+    # The only intraday bar is the stray one: a single bar can't fire anything.
+    assert all(r.occurrences == 0 for r in report.rules)
+    assert report.timeframe == "intraday"
 
 
 async def test_walkforward_rejects_a_range_shorter_than_one_window(engine):
@@ -254,7 +276,7 @@ async def test_walkforward_endpoint_turns_bad_windows_into_400():
 def _store(tmp_path: Path) -> CalibrationStore:
     weights = {"_default": {"golden_cross": 0.75, "death_cross": 0.75, "breakout": 0.75, "concentration_risk": 0.8}}
     metadata = {"calibrated_at": None, "source": None, "report_window": None}
-    return CalibrationStore(tmp_path / "data", tmp_path / "confidence_config.py", weights, metadata)
+    return CalibrationStore(tmp_path / "data", weights, metadata)
 
 
 def _write(path: Path, payload: dict) -> None:
@@ -262,9 +284,9 @@ def _write(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload))
 
 
-def _wf_rule(name, suggested, aggregate=0.6, by_ticker=None):
+def _wf_rule(name, suggested, aggregate=0.6, by_ticker=None, occurrences=120):
     return {"rule_name": name, "aggregate_hit_rate": aggregate, "suggested_confidence": suggested,
-            "sample_size_warning": False, "by_ticker": by_ticker or {}}
+            "total_occurrences": occurrences, "sample_size_warning": False, "by_ticker": by_ticker or {}}
 
 
 def _wf_ticker(total_evaluated, windows_evaluated, suggested):
@@ -281,6 +303,7 @@ WALKFORWARD = {
             "NVDA": _wf_ticker(25, 9, 0.80),   # too few evaluations
         }),
         _wf_rule("death_cross", 0.3, aggregate=None),
+        _wf_rule("breakout", 0.9, aggregate=0.9, occurrences=19),  # confirmation left too few
         _wf_rule("concentration_risk", 0.9),
     ],
 }
@@ -307,8 +330,11 @@ def test_apply_prefers_the_newer_walkforward_report(tmp_path):
     assert store.weights["AAPL"] == {"golden_cross": 0.66}
     assert "MSFT" not in store.weights and "NVDA" not in store.weights
     assert result["overrides"] == {"AAPL": {"golden_cross": {"old": None, "new": 0.66}}}
-    # No graded events and portfolio-level rules keep their weights.
+    # No graded events, too few confirmed occurrences, and portfolio-level
+    # rules all keep their weights.
     assert store.weights["_default"]["death_cross"] == 0.75
+    assert store.weights["_default"]["breakout"] == 0.75
+    assert any("breakout" in w for w in result["warnings"])
     assert store.weights["_default"]["concentration_risk"] == 0.8
     assert store.metadata["source"] == "walkforward"
     assert store.metadata["report_window"] == {"start": "2024-01-01", "end": "2026-01-01"}
@@ -339,23 +365,48 @@ def test_apply_without_any_report_is_an_error(tmp_path):
         _store(tmp_path).apply_latest_report()
 
 
-def test_applied_config_file_round_trips(tmp_path):
+def test_applied_weights_are_saved_to_data_and_reload_on_startup(tmp_path):
     store = _store(tmp_path)
     _write(store.walkforward_path, WALKFORWARD)
     store.apply_latest_report()
 
-    loaded = runpy.run_path(str(store.config_path))
+    fresh = _store(tmp_path)  # a restarted API: committed defaults in memory
+    assert fresh.load_live_weights()
 
-    assert loaded["CONFIDENCE_WEIGHTS"] == store.weights
-    assert loaded["WEIGHTS_METADATA"] == store.metadata
-    assert list(loaded["CONFIDENCE_WEIGHTS"])[0] == "_default"
+    assert fresh.weights == store.weights
+    assert fresh.metadata == store.metadata
+    assert json.loads(store.weights_path.read_text())["metadata"]["source"] == "walkforward"
 
 
-def test_committed_config_is_what_the_writer_produces():
-    path = Path(confidence_config.__file__)
-    assert path.read_text() == render_config(
-        confidence_config.CONFIDENCE_WEIGHTS, confidence_config.WEIGHTS_METADATA,
-    ), "regenerate confidence_config.py through persistence.render_config"
+def test_reload_keeps_defaults_for_rules_the_file_predates(tmp_path):
+    store = _store(tmp_path)
+    _write(store.weights_path, {
+        "weights": {"_default": {"golden_cross": 0.5}, "AAPL": {"golden_cross": 0.6}},
+        "metadata": {"calibrated_at": "2026-10-07T00:00:00+00:00", "source": "walkforward",
+                     "report_window": {"start": "2024-01-01", "end": "2026-01-01"}},
+    })
+
+    assert store.load_live_weights()
+
+    assert store.weights["_default"]["golden_cross"] == 0.5
+    assert store.weights["_default"]["breakout"] == 0.75  # not in the file: default
+    assert store.weights["AAPL"] == {"golden_cross": 0.6}
+
+
+def test_missing_or_malformed_weights_file_keeps_the_defaults(tmp_path):
+    store = _store(tmp_path)
+    assert not store.load_live_weights()
+    _write(store.weights_path, {"weights": {"_default": {"golden_cross": "high"}}, "metadata": {}})
+    assert not store.load_live_weights()
+    assert store.weights["_default"]["golden_cross"] == 0.75
+
+
+def test_calibrating_never_touches_the_committed_defaults_file():
+    from src.backtest.persistence import STORE
+
+    assert STORE.weights_path == Path("data") / "confidence_weights.json"
+    source = Path(confidence_config.__file__).read_text()
+    assert "data/confidence_weights.json" in source
 
 
 # ---------- live lookup ----------
@@ -365,6 +416,65 @@ def test_engine_prefers_a_ticker_override(monkeypatch):
     monkeypatch.setitem(confidence_config.CONFIDENCE_WEIGHTS, "AAPL", {"golden_cross": 0.66})
 
     assert signal_engine._conf("golden_cross", "AAPL") == 0.66
-    assert signal_engine._conf("golden_cross", "MSFT") == confidence_config.CONFIDENCE_WEIGHTS["_default"]["golden_cross"]
+    assert signal_engine._conf("golden_cross", "NO-SUCH-TICKER") == confidence_config.CONFIDENCE_WEIGHTS["_default"]["golden_cross"]
     assert signal_engine._conf("breakout", "AAPL") == confidence_config.CONFIDENCE_WEIGHTS["_default"]["breakout"]
     assert signal_engine._conf("unknown_rule", "AAPL", fallback=0.42) == 0.42
+
+
+# ---------- automatic calibration (after every backfill) ----------
+
+
+def test_recalibrating_a_rule_replaces_its_ticker_overrides(tmp_path):
+    store = _store(tmp_path)
+    store.weights["MSFT"] = {"golden_cross": 0.9}  # stale: MSFT no longer qualifies
+    store.weights["TSLA"] = {"breakout": 0.5}      # breakout isn't recalibrated: kept
+    _write(store.walkforward_path, WALKFORWARD)
+
+    result = store.apply_latest_report()
+
+    assert "MSFT" not in store.weights
+    assert store.weights["TSLA"] == {"breakout": 0.5}
+    assert store.weights["AAPL"] == {"golden_cross": 0.66}
+    assert result["removed_overrides"] == {"MSFT": ["golden_cross"]}
+
+
+async def test_calibrate_runs_a_walkforward_over_all_stored_history_and_applies_it(engine, history, tmp_path):
+    from src.backtest.calibration import calibrate
+
+    store = _store(tmp_path)
+    result = await calibrate(engine, ["STBL", "SWNG", "LATE"], store=store, today=END)
+
+    assert result["start_date"] == "2024-01-01"  # the earliest stored bar
+    assert result["windows"] == 12
+    assert result["source"] == "walkforward"
+    assert store.walkforward_path.exists()
+    # Breakout: pooled 50% across STBL+SWNG+LATE with some instability -> recalibrated.
+    assert store.weights["_default"]["breakout"] == pytest.approx(result["updated"]["breakout"]["new"])
+    assert store.weights["_default"]["breakout"] < 0.75
+    # Crosses never fire here (no daily cross confirms) -> defaults untouched.
+    assert store.weights["_default"]["golden_cross"] == 0.75
+    assert store.metadata["source"] == "walkforward"
+
+
+async def test_calibrate_without_history_is_reported_not_raised_by_the_api(engine, tmp_path):
+    from src.backtest.calibration import calibrate
+
+    with pytest.raises(ValueError, match="no price history"):
+        await calibrate(engine, ["NOPE"], store=_store(tmp_path))
+
+
+def test_calibration_summary_line():
+    from src.cli.launcher import _Calibration, calibration_summary
+
+    cal = _Calibration.model_validate({
+        "windows": 47,
+        "updated": {"breakout": {"old": 0.39, "new": 0.41}},
+        "overrides": {"AAPL": {"breakout": {"old": None, "new": 0.5}}},
+        "removed_overrides": {"MSFT": ["golden_cross"]},
+        "skipped": ["golden_cross: only 0 confirmed occurrences", "drawdown_alert: portfolio-level rule"],
+    })
+    assert calibration_summary(cal) == (
+        "[calibrate] walk-forward over 47 windows: breakout 0.39→0.41; "
+        "1 ticker override(s) set, 1 removed; unchanged (too little evidence): golden_cross"
+    )
+    assert calibration_summary(_Calibration(not_run="no price history")) == "[calibrate] not run: no price history"

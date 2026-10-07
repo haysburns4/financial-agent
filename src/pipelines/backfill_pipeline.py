@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from src.models import Indicator, PriceBar
 from src.pipelines.validators import RawPriceBar
+from src.signals.confirmation import is_daily
 from src.signals.technical import compute_indicators
 
 
@@ -294,7 +295,12 @@ class BackfillPipeline:
                 "volume": [r.volume for r in rows],
             }
         )
-        df = await asyncio.to_thread(compute_indicators, df)
+        # Daily and 5-minute bars are separate series: an EMA over both
+        # interleaved is neither a daily nor an intraday EMA.
+        daily_mask = df["timestamp"].map(is_daily)
+        parts = [part.reset_index(drop=True) for part in (df[daily_mask], df[~daily_mask]) if not part.empty]
+        computed = [await asyncio.to_thread(compute_indicators, part) for part in parts]
+        df = pd.concat(computed, ignore_index=True)
 
         indicator_rows: list[dict] = []
         for _, r in df.iterrows():

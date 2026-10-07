@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from loguru import logger
 
+from src.backtest import persistence as backtest_persistence
 from src.config import settings
 from src.db import engine, init_db
 from src.etrade.auth import auth
@@ -25,6 +26,15 @@ async def lifespan(app):
         logger.info("E-Trade tokens loaded from disk; auth restored")
     else:
         logger.info("No persisted E-Trade tokens; OAuth flow required")
+
+    if backtest_persistence.STORE.load_live_weights():
+        meta = backtest_persistence.STORE.metadata
+        logger.info(
+            "Calibrated signal weights loaded ({} calibration at {})",
+            meta["source"], meta["calibrated_at"],
+        )
+    else:
+        logger.info("No calibrated signal weights saved; using the defaults")
 
     scheduler = build_scheduler()
     scheduler.start()

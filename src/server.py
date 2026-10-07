@@ -1,5 +1,6 @@
 from dataclasses import asdict
 from datetime import date, timezone
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from src.agui import create_agui_router
 from src.alerts.discord import build_synthesis_context
 from src.backtest import persistence as backtest_persistence
+from src.backtest.calibration import calibrate
 from src.backtest.runner import BacktestRunner
 from src.config import settings
 from src.db import engine, get_connection, health_check
@@ -23,7 +25,7 @@ from src.scheduler import (
     price_pipeline,
     signal_synthesizer,
 )
-from src.signals.engine import SIGNAL_CATEGORIES, signal_types_for_category
+from src.signals.engine import FILTER_STATS, SIGNAL_CATEGORIES, signal_types_for_category
 
 
 class CompleteAuthBody(BaseModel):
@@ -35,6 +37,8 @@ class BackfillRequest(BaseModel):
     period_daily: str = "2y"
     period_intraday: str = "60d"
     interval_intraday: str = "5m"
+    # Re-run the walk-forward over all stored history and apply it afterwards.
+    calibrate: bool = True
 
 
 class BacktestRequest(BaseModel):
@@ -43,6 +47,9 @@ class BacktestRequest(BaseModel):
     end_date: date
     forward_window_days: int = 5
     outcome_threshold_pct: float = 0.01
+    # "daily": years of history; "intraday": the 5-minute bars live signals
+    # fire on (only as far back as backfills have collected them).
+    timeframe: Literal["daily", "intraday"] = "daily"
 
 
 class WalkforwardRequest(BacktestRequest):
@@ -69,7 +76,14 @@ def create_app() -> FastAPI:
     async def health():
         ok = await health_check()
         # `service` lets the launcher recognise an instance it can reuse.
-        return {"status": "ok" if ok else "degraded", "db": ok, "service": "financial-agent"}
+        return {
+            "status": "ok" if ok else "degraded",
+            "db": ok,
+            "service": "financial-agent",
+            # Daily-trend confirmation of 5-minute signals; in memory, so it
+            # counts from the API's last restart within the 24h window.
+            "signal_filter_stats": {"last_24h": FILTER_STATS.last_24h()},
+        }
 
     @app.post("/auth/start")
     async def auth_start():
@@ -303,7 +317,18 @@ def create_app() -> FastAPI:
             result.daily_bars_added, result.intraday_bars_added,
             result.indicators_computed, len(result.errors),
         )
-        return asdict(result)
+        # Fresh data -> fresh confidence weights. A calibration problem never
+        # fails the backfill: the bars are stored either way.
+        calibration: dict | None = None
+        if body.calibrate:
+            try:
+                calibration = await calibrate(engine, tickers)
+            except ValueError as exc:
+                calibration = {"not_run": str(exc)}
+            except Exception as exc:
+                logger.exception("calibration after backfill failed")
+                calibration = {"error": f"{type(exc).__name__}: {exc}"}
+        return {**asdict(result), "calibration": calibration}
 
     @app.get("/prices/{ticker}/coverage")
     async def price_coverage(
@@ -382,6 +407,7 @@ def create_app() -> FastAPI:
             end_date=body.end_date,
             forward_window_days=body.forward_window_days,
             outcome_threshold_pct=body.outcome_threshold_pct,
+            timeframe=body.timeframe,
         )
         backtest_persistence.STORE.save_report(report)
         return asdict(report)
@@ -406,6 +432,7 @@ def create_app() -> FastAPI:
                 step_months=body.step_months,
                 forward_window_days=body.forward_window_days,
                 outcome_threshold_pct=body.outcome_threshold_pct,
+                timeframe=body.timeframe,
             )
         except ValueError as exc:
             # Bad windowing (e.g. range shorter than one train + test span).

@@ -1,19 +1,26 @@
-"""Save / load backtest reports + apply suggested weights to the live config.
+"""Save / load backtest reports + apply suggested weights to the live weights.
 
-The "live" config is [src/backtest/confidence_config.py](src/backtest/confidence_config.py)'s
-two-tier `CONFIDENCE_WEIGHTS` (`_default` per rule, plus per-ticker overrides)
-and its `WEIGHTS_METADATA`. Applying mutates those dicts in place so
-already-imported modules (notably src/signals/engine.py) see the new values
-immediately, AND rewrites the source file so the change survives restarts.
+The live weights are the in-memory dicts of
+[src/backtest/confidence_config.py](src/backtest/confidence_config.py): two-tier
+`CONFIDENCE_WEIGHTS` (`_default` per rule, plus per-ticker overrides) and
+`WEIGHTS_METADATA`. That source file holds only the committed defaults.
+Applying mutates the dicts in place, so already-imported modules (notably
+src/signals/engine.py) see the new values immediately, and writes them to
+data/confidence_weights.json, which the API loads over the defaults at startup.
 
 Everything goes through a `CalibrationStore` whose paths and dicts are
 injected, so tests calibrate against temp files instead of the real ones.
 """
+import copy
 import json
+import os
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from loguru import logger
+from pydantic import TypeAdapter, ValidationError
 
 from src.backtest import confidence_config
 from src.backtest.confidence_config import WeightsMetadata
@@ -26,37 +33,12 @@ _MIN_OVERRIDE_EVALUATED = 30
 # ...and, from a walk-forward report, evidence from this many separate test
 # windows, so one lucky stretch (one regime) cannot set it.
 _MIN_OVERRIDE_WINDOWS = 6
+# Daily-trend confirmation thins rules out; below this many confirmed
+# occurrences across all walk-forward windows a rule keeps its _default.
+_MIN_WALKFORWARD_OCCURRENCES = 20
 
-_CONFIG_HEADER = '''"""Calibrated confidence weights per signal rule, in two tiers.
-
-`CONFIDENCE_WEIGHTS["_default"]` holds one weight per rule. Every other key is
-a ticker, mapping rules to an override for that ticker only; the live signal
-engine uses the override when there is one and `_default` otherwise.
-
-`WEIGHTS_METADATA` records when the weights were last calibrated, from which
-backtest type ("walkforward" or "single_window"), and over which report window
-(`{"start": ..., "end": ...}`); all None until the first calibration.
-
-Edit manually or via `POST /backtest/apply`, which rewrites this file (header
-included, from src/backtest/persistence.py) with the latest report's suggested
-confidences. Mutating these dicts in-process takes effect immediately because
-the signal engine reads them by attribute lookup, not by import binding.
-"""
-from typing import Literal, TypedDict
-
-
-class ReportWindow(TypedDict):
-    start: str
-    end: str
-
-
-class WeightsMetadata(TypedDict):
-    calibrated_at: str | None
-    source: Literal["walkforward", "single_window"] | None
-    report_window: ReportWindow | None
-
-
-'''
+_WEIGHTS = TypeAdapter(dict[str, dict[str, float]])
+_METADATA = TypeAdapter(WeightsMetadata)
 
 
 def _json_default(obj: Any):  # anti-slop: allow no-any-parameters - signature is dictated by json.dumps(default=...)
@@ -65,24 +47,6 @@ def _json_default(obj: Any):  # anti-slop: allow no-any-parameters - signature i
     if isinstance(obj, date):
         return obj.isoformat()
     raise TypeError(f"not JSON serializable: {type(obj).__name__}")
-
-
-def render_config(weights: dict[str, dict[str, float]], metadata: WeightsMetadata) -> str:
-    """The full text of confidence_config.py for these weights and metadata."""
-    lines = [_CONFIG_HEADER.rstrip("\n"), "", "CONFIDENCE_WEIGHTS: dict[str, dict[str, float]] = {"]
-    # _default first, then tickers alphabetically, so diffs stay readable.
-    for tier in sorted(weights, key=lambda k: (k != "_default", k)):
-        lines.append(f'    "{tier}": {{')
-        for rule, weight in weights[tier].items():
-            lines.append(f'        "{rule}": {float(weight):.4f},')
-        lines.append("    },")
-    lines.append("}")
-    lines.append("")
-    lines.append("WEIGHTS_METADATA: WeightsMetadata = {")
-    for key in ("calibrated_at", "source", "report_window"):
-        lines.append(f'    "{key}": {metadata[key]!r},')
-    lines.append("}")
-    return "\n".join(lines) + "\n"
 
 
 def _generated_at(payload: dict | None) -> datetime | None:
@@ -98,15 +62,50 @@ class CalibrationStore:
     def __init__(
         self,
         data_dir: Path,
-        config_path: Path,
         weights: dict[str, dict[str, float]],
         metadata: WeightsMetadata,
     ) -> None:
         self.report_path = data_dir / "backtest_latest.json"
         self.walkforward_path = data_dir / "walkforward_latest.json"
-        self.config_path = config_path
+        self.weights_path = data_dir / "confidence_weights.json"
         self.weights = weights
         self.metadata = metadata
+        # The committed defaults, for rules a saved file predates.
+        self._default_rules = dict(weights.get("_default", {}))
+
+    # ---------- live weights ----------
+
+    def load_live_weights(self) -> bool:
+        """Replace the in-memory weights with the last calibration's, if saved.
+
+        The file is authoritative for every tier it has; a rule added to the
+        committed defaults since it was written keeps its default. A missing or
+        malformed file leaves the defaults in place.
+        """
+        payload = self._load(self.weights_path)
+        if payload is None:
+            return False
+        try:
+            weights = _WEIGHTS.validate_python(payload.get("weights"))
+            metadata = _METADATA.validate_python(payload.get("metadata"))
+        except ValidationError as exc:
+            logger.warning("ignoring malformed {}: {}", self.weights_path, exc)
+            return False
+        defaults = weights.setdefault("_default", {})
+        for rule, weight in self._default_rules.items():
+            defaults.setdefault(rule, weight)
+        self.weights.clear()
+        self.weights.update(weights)
+        self.metadata.update(metadata)
+        return True
+
+    def _write_live_weights(self) -> None:
+        """Atomically, so a crash mid-write can't leave a half-written file."""
+        self.weights_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"weights": copy.deepcopy(self.weights), "metadata": dict(self.metadata)}
+        tmp = self.weights_path.with_name(self.weights_path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n")
+        os.replace(tmp, self.weights_path)
 
     # ---------- reports ----------
 
@@ -138,16 +137,10 @@ class CalibrationStore:
     # ---------- applying ----------
 
     def apply_latest_report(self) -> dict:
-        """Push the latest report's suggested weights into the live config + file.
+        """Apply the newer of the two persisted reports (see `apply_report`).
 
         Prefers the walk-forward report when it is newer than the single-window
         one: its suggested confidences already carry the stability penalty.
-
-        Policy: portfolio/position-conditional rules keep their static weights
-        (they aren't measurable in a per-ticker price backtest), and rules with
-        no graded events keep theirs too — silence ≠ evidence. Ticker overrides
-        are written only where that ticker has enough evidence of its own; they
-        are added or updated, never removed.
         """
         single = self.load_report_json()
         walkforward = self.load_walkforward_json()
@@ -161,13 +154,27 @@ class CalibrationStore:
             single is None or single_at is None
             or (walkforward_at is not None and walkforward_at > single_at)
         )
-        source = "walkforward" if use_walkforward else "single_window"
         payload = walkforward if use_walkforward else single
         assert payload is not None  # one of them exists, checked above
+        return self.apply_report(payload, walkforward=use_walkforward)
 
+    def apply_report(self, payload: dict, walkforward: bool) -> dict:
+        """Push one report's suggested weights into the live weights + their file.
+
+        Policy: portfolio/position-conditional rules keep their static weights
+        (they aren't measurable in a per-ticker price backtest), and rules with
+        no graded events — or, from walk-forward, too few confirmed ones — keep
+        theirs too: silence ≠ evidence. For each rule it does recalibrate, the
+        report replaces that rule's ticker overrides: a ticker keeps one only
+        while it has enough evidence of its own, so stale overrides don't pile
+        up as calibration repeats.
+        """
+        use_walkforward = walkforward
+        source = "walkforward" if use_walkforward else "single_window"
         defaults = self.weights.setdefault("_default", {})
         updated: dict[str, dict] = {}
         overrides: dict[str, dict[str, dict]] = {}
+        removed: dict[str, list[str]] = {}
         skipped: list[str] = []
         warnings: list[str] = []
 
@@ -180,6 +187,13 @@ class CalibrationStore:
             if hit_rate is None:
                 skipped.append(f"{name}: no graded events in the report, weight unchanged")
                 continue
+            if use_walkforward and r.get("total_occurrences", 0) < _MIN_WALKFORWARD_OCCURRENCES:
+                skipped.append(
+                    f"{name}: only {r.get('total_occurrences')} confirmed occurrences across all "
+                    f"windows (< {_MIN_WALKFORWARD_OCCURRENCES}), default unchanged"
+                )
+                warnings.append(f"{name}: too few confirmed signals to recalibrate")
+                continue
 
             new = float(r["suggested_confidence"])
             updated[name] = {"old": defaults.get(name), "new": new}
@@ -191,6 +205,7 @@ class CalibrationStore:
                     else f"{name}: sample_size < {_MIN_OVERRIDE_EVALUATED}, treat with caution"
                 )
 
+            qualifying: dict[str, float] = {}
             for ticker, t in (r.get("by_ticker") or {}).items():
                 if use_walkforward:
                     qualifies = (
@@ -199,10 +214,18 @@ class CalibrationStore:
                     )
                 else:
                     qualifies = t["evaluated"] >= _MIN_OVERRIDE_EVALUATED
-                if not qualifies:
-                    continue
+                if qualifies:
+                    qualifying[ticker] = float(t["suggested_confidence"])
+
+            for ticker in [k for k in self.weights if k != "_default"]:
+                tier = self.weights[ticker]
+                if name in tier and ticker not in qualifying:
+                    del tier[name]
+                    removed.setdefault(ticker, []).append(name)
+                if not tier:
+                    del self.weights[ticker]
+            for ticker, ticker_new in qualifying.items():
                 tier = self.weights.setdefault(ticker, {})
-                ticker_new = float(t["suggested_confidence"])
                 overrides.setdefault(ticker, {})[name] = {"old": tier.get(name), "new": ticker_new}
                 tier[name] = ticker_new
 
@@ -213,12 +236,13 @@ class CalibrationStore:
             "start": str(payload.get("start_date")),
             "end": str(payload.get("end_date")),
         }
-        self.config_path.write_text(render_config(self.weights, self.metadata))
+        self._write_live_weights()
 
         return {
             "source": source,
             "updated": updated,
             "overrides": overrides,
+            "removed_overrides": removed,
             "skipped": skipped,
             "warnings": warnings,
             "report_generated_at": payload.get("generated_at"),
@@ -227,9 +251,9 @@ class CalibrationStore:
 
 
 # The live store: data/ next to the DB, and the real config module's dicts.
+# The API calls STORE.load_live_weights() at startup (src/main.py).
 STORE = CalibrationStore(
     data_dir=Path("data"),
-    config_path=Path(confidence_config.__file__),
     weights=confidence_config.CONFIDENCE_WEIGHTS,
     metadata=confidence_config.WEIGHTS_METADATA,
 )

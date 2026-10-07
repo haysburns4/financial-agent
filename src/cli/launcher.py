@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import signal
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -38,6 +39,8 @@ BUILD_INPUTS = ("package-lock.json", "package.json", "next.config.ts", "tsconfig
 class Options:
     dev: bool = False
     open_browser: bool = True
+    # A Yahoo period ("1mo", "5y") of daily bars to refresh at startup; None skips.
+    backfill: str | None = None
 
 
 class PortClaim(StrEnum):
@@ -48,6 +51,54 @@ class PortClaim(StrEnum):
 
 class _Health(BaseModel):
     service: str
+
+
+class _Change(BaseModel):
+    old: float | None
+    new: float
+
+
+class _Calibration(BaseModel):
+    windows: int | None = None
+    updated: dict[str, _Change] = {}
+    overrides: dict[str, dict[str, _Change]] = {}
+    removed_overrides: dict[str, list[str]] = {}
+    skipped: list[str] = []
+    not_run: str | None = None
+    error: str | None = None
+
+
+class _BackfillResult(BaseModel):
+    tickers_processed: int
+    daily_bars_added: int
+    intraday_bars_added: int
+    errors: list[str]
+    duration_seconds: float
+    calibration: _Calibration | None = None
+
+
+_PORTFOLIO_RULES = ("stop_loss_warning", "concentration_risk", "drawdown_alert")
+
+
+def calibration_summary(cal: _Calibration) -> str:
+    """One line for the terminal: what the post-backfill calibration changed."""
+    if cal.error:
+        return f"[calibrate] failed: {cal.error}"
+    if cal.not_run:
+        return f"[calibrate] not run: {cal.not_run}"
+    changes = [
+        f"{rule} {'—' if c.old is None else f'{c.old:.2f}'}→{c.new:.2f}"
+        for rule, c in sorted(cal.updated.items())
+    ]
+    parts = [f"walk-forward over {cal.windows} windows: " + (", ".join(changes) or "no defaults changed")]
+    overrides = sum(len(rules) for rules in cal.overrides.values())
+    removed = sum(len(rules) for rules in cal.removed_overrides.values())
+    if overrides or removed:
+        parts.append(f"{overrides} ticker override(s) set, {removed} removed")
+    kept = sorted({s.split(":")[0] for s in cal.skipped} - set(_PORTFOLIO_RULES))
+    if kept:
+        parts.append(f"unchanged (too little evidence): {', '.join(kept)}")
+    return "[calibrate] " + "; ".join(parts)
 
 
 def _files(directory: Path) -> Iterator[Path]:
@@ -124,6 +175,7 @@ class Launcher:
         if api_claim is PortClaim.FREE and not self._start_api(api_url):
             return 1
         self._login(api_url)
+        backfill = self._start_backfill(api_url, options.backfill) if options.backfill else None
         if web_claim is PortClaim.FREE and not self._start_web(web_url, options):
             return 1
 
@@ -131,6 +183,8 @@ class Launcher:
         if options.open_browser:
             self.open_url(web_url)
         if not self.supervisor.children:
+            if backfill is not None:
+                backfill.join()
             self.io.info("Both parts were already running; nothing left for this terminal to do.")
             return 0
         self.io.info("Press Ctrl-C to stop.")
@@ -268,6 +322,42 @@ class Launcher:
                 login(client, self.io, self.open_url)
         except httpx.HTTPError as exc:
             self.io.info(f"E-Trade login failed talking to the API ({type(exc).__name__}); try `./start login`.")
+
+    # ---------- 5b. backfill ----------
+
+    def _start_backfill(self, api_url: str, period: str) -> threading.Thread:
+        """Refresh daily (and the last 60 days of 5-minute) bars in the background.
+
+        Daily-trend confirmation needs a recent completed daily bar, and nothing
+        else refreshes them when the app isn't left running. The API then
+        recalibrates signal confidences from the refreshed history.
+        """
+        self.io.info(
+            f"Refreshing price history from Yahoo ({period} of daily bars) and recalibrating "
+            "signal confidence in the background…"
+        )
+
+        def run() -> None:
+            try:
+                response = httpx.post(
+                    f"{api_url}/pipeline/backfill/run", json={"period_daily": period}, timeout=None,
+                )
+                response.raise_for_status()
+                result = _BackfillResult.model_validate_json(response.content)
+            except (httpx.HTTPError, ValidationError) as exc:
+                self.supervisor.say(f"[backfill] failed: {type(exc).__name__}: {exc}")
+                return
+            errors = f", {len(result.errors)} error(s)" if result.errors else ""
+            self.supervisor.say(
+                f"[backfill] {result.tickers_processed} tickers: {result.daily_bars_added} daily + "
+                f"{result.intraday_bars_added} intraday bars in {result.duration_seconds:.0f}s{errors}"
+            )
+            if result.calibration is not None:
+                self.supervisor.say(calibration_summary(result.calibration))
+
+        thread = threading.Thread(target=run, name="backfill", daemon=True)
+        thread.start()
+        return thread
 
     # ---------- 6. web ----------
 

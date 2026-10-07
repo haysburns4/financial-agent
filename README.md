@@ -33,6 +33,7 @@ http://127.0.0.1:3000. Ctrl-C stops everything. Later runs skip whatever is alre
 ```
 ./start --dev          # web UI with hot reload (`next dev`) instead of a production build
 ./start --no-browser   # don't open the dashboard
+./start --backfill     # refresh price history and recalibrate signal confidence (`--backfill 5y` the first time)
 ./start login          # log in to E-Trade again, against the running app
 ./start setup --all    # change settings (writes .env)
 ./start doctor         # check keys, Node, ports, and shell variables that override .env

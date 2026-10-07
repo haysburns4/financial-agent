@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from src.etrade.market import ETradeMarketClient
 from src.models import Indicator, PipelineRun, PriceBar
 from src.pipelines.validators import RawPriceBar, ValidatedPriceBar
+from src.signals.confirmation import is_daily
 from src.signals.technical import compute_indicators
 
 
@@ -211,13 +212,16 @@ class PricePipeline:
     async def _load_history(
         self, conn: AsyncConnection, ticker: str, limit: int
     ) -> pd.DataFrame:
+        # Intraday bars only: indicators here are for the live 5-minute series,
+        # and upserting values computed across daily bars would overwrite the
+        # daily bars' own indicators. Over-fetch, since daily bars are skipped.
         stmt = (
             select(PriceBar)
             .where(PriceBar.ticker == ticker)
             .order_by(PriceBar.timestamp.desc())
-            .limit(limit)
+            .limit(limit * 3)
         )
-        rows = (await conn.execute(stmt)).all()
+        rows = [r for r in (await conn.execute(stmt)).all() if not is_daily(r.timestamp)][:limit]
         if not rows:
             return pd.DataFrame()
         records = [

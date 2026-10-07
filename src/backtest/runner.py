@@ -5,9 +5,10 @@ lookahead semantics: at each bar i the rule sees only bars [0..i] and is
 graded against the forward window [i+1 .. i+forward_window_days].
 
 The output is a per-rule hit rate (`wins / evaluated`) that the dev can
-review and — via POST /backtest/apply — push back into
-[src/backtest/confidence_config.py](src/backtest/confidence_config.py) as
-the calibrated confidence weight used by the live signal engine.
+review and — via POST /backtest/apply, or automatically after a backfill —
+apply as the calibrated confidence weight used by the live signal engine
+(saved to data/confidence_weights.json; defaults in
+[src/backtest/confidence_config.py](src/backtest/confidence_config.py)).
 
 `run_walkforward` is the more honest variant: it splits the range into
 rolling train/test windows and reports each rule's out-of-sample hit rate per
@@ -15,8 +16,14 @@ test window, how much that swings between windows, and a suggested confidence
 discounted for the swing. Rules are fixed, not fitted, so the train window
 only guarantees the ticker had enough history for its indicators to settle.
 
-Replays read daily bars only (the backfill stamps them at UTC midnight), so
-`forward_window_days` means trading days rather than 5-minute bars.
+Both runners take a `timeframe`: "daily" (the default; years of history, so
+walk-forward works) or "intraday" (the 5-minute bars live signals fire on;
+Yahoo serves ~60 days, more as backfills accumulate). Either way
+`forward_window_days` is in trading days, and every signal must pass the same
+daily-trend confirmation as live (src/signals/confirmation.py), judged on the
+last *completed* day — so occurrence counts drop versus unconfirmed replays.
+In the daily timeframe that rules out golden/death crosses entirely: the day
+before a daily cross always has the opposite EMA order.
 
 This module deliberately re-implements rule evaluation against a list of
 Row objects instead of reusing `SignalEngine._entry_signals` /
@@ -24,19 +31,31 @@ Row objects instead of reusing `SignalEngine._entry_signals` /
 loading per-bar history from the DB). Keeping a local `evaluate_rules`
 makes the no-lookahead slicing explicit and self-contained.
 """
+import bisect
 import calendar
 import statistics
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Any
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Literal
 
 from loguru import logger
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from src.models import Indicator, PriceBar
+from src.signals.confirmation import (
+    DailyBar,
+    Decision,
+    decide,
+    is_daily,
+    last_completed_bar,
+    trend_from_bar,
+)
 from src.signals.engine import SIGNAL_CATEGORIES
+
+Timeframe = Literal["daily", "intraday"]
+_TIMEFRAMES = ("daily", "intraday")
 
 
 _BREAKOUT_LOOKBACK = 20
@@ -81,7 +100,7 @@ class BacktestEvent:
     signal_bar_timestamp: datetime
     signal_bar_close: float
     forward_close: float | None
-    outcome: str  # "win" | "loss" | "insufficient_data" | "skipped"
+    outcome: str  # "win" | "loss" | "insufficient_data" | "skipped" | "filtered"
 
 
 @dataclass
@@ -93,6 +112,7 @@ class TickerRuleStats:
     wins: int
     hit_rate: float | None
     suggested_confidence: float
+    filtered: int = 0  # dropped by daily-trend confirmation; not in occurrences
 
 
 @dataclass
@@ -106,6 +126,7 @@ class RuleStats:
     avg_forward_return: float
     suggested_confidence: float
     sample_size_warning: bool
+    filtered: int = 0  # dropped by daily-trend confirmation; not in occurrences
     by_ticker: dict[str, TickerRuleStats] = field(default_factory=dict)
 
 
@@ -119,6 +140,7 @@ class BacktestReport:
     rules: list[RuleStats]
     total_events: int
     generated_at: datetime
+    timeframe: Timeframe = "daily"
 
 
 @dataclass
@@ -138,7 +160,8 @@ class WalkforwardStats:
     events, in chronological order."""
 
     windows_evaluated: int
-    total_occurrences: int
+    total_occurrences: int  # confirmed signals only
+    total_filtered: int  # dropped by daily-trend confirmation
     total_evaluated: int
     aggregate_hit_rate: float | None  # pooled: total wins / total evaluated
     window_hit_rates: list[float]
@@ -175,6 +198,7 @@ class WalkforwardReport:
     rules: list[WalkforwardRuleStats]
     tickers: list[str]
     generated_at: datetime
+    timeframe: Timeframe = "daily"
 
 
 def evaluate_rules(history: list[HistoryBar]) -> list[str]:
@@ -245,7 +269,8 @@ def _clamp_confidence(value: float) -> float:
     return max(_CONFIDENCE_FLOOR, min(_CONFIDENCE_CEILING, value))
 
 
-def _ticker_rule_stats(events: list[BacktestEvent]) -> TickerRuleStats:
+def _ticker_rule_stats(all_events: list[BacktestEvent]) -> TickerRuleStats:
+    events = [e for e in all_events if e.outcome != "filtered"]
     evaluable = [e for e in events if e.outcome in ("win", "loss")]
     wins = sum(e.outcome == "win" for e in evaluable)
     hit_rate = wins / len(evaluable) if evaluable else None
@@ -255,6 +280,7 @@ def _ticker_rule_stats(events: list[BacktestEvent]) -> TickerRuleStats:
         wins=wins,
         hit_rate=hit_rate,
         suggested_confidence=_CONFIDENCE_FLOOR if hit_rate is None else _clamp_confidence(hit_rate),
+        filtered=len(all_events) - len(events),
     )
 
 
@@ -263,7 +289,8 @@ def _aggregate(events: list[BacktestEvent]) -> list[RuleStats]:
     # Include every known rule so the report shape is stable even when a rule
     # never fired in the backtest window.
     for rule in SIGNAL_CATEGORIES.keys():
-        rule_events = [e for e in events if e.rule_name == rule]
+        all_rule_events = [e for e in events if e.rule_name == rule]
+        rule_events = [e for e in all_rule_events if e.outcome != "filtered"]
         evaluable = [e for e in rule_events if e.outcome in ("win", "loss")]
         wins = [e for e in evaluable if e.outcome == "win"]
         losses = [e for e in evaluable if e.outcome == "loss"]
@@ -281,7 +308,7 @@ def _aggregate(events: list[BacktestEvent]) -> list[RuleStats]:
             suggested = max(_CONFIDENCE_FLOOR, min(_CONFIDENCE_CEILING, hit_rate))
 
         by_ticker: dict[str, list[BacktestEvent]] = defaultdict(list)
-        for e in rule_events:
+        for e in all_rule_events:
             by_ticker[e.ticker].append(e)
 
         stats.append(RuleStats(
@@ -294,6 +321,7 @@ def _aggregate(events: list[BacktestEvent]) -> list[RuleStats]:
             avg_forward_return=avg_forward_return,
             suggested_confidence=suggested,
             sample_size_warning=len(evaluable) < _MIN_EVALUATED_SAMPLES,
+            filtered=len(all_rule_events) - len(rule_events),
             by_ticker={t: _ticker_rule_stats(es) for t, es in sorted(by_ticker.items())},
         ))
     return stats
@@ -337,13 +365,26 @@ def walkforward_windows(
         i += 1
 
 
+def _add_trading_days(ts: datetime, days: int) -> datetime:
+    """`ts` moved forward `days` weekdays, same time of day (holidays ignored)."""
+    while days > 0:
+        ts += timedelta(days=1)
+        if ts.weekday() < 5:
+            days -= 1
+    return ts
+
+
 @dataclass
 class _Tally:
     occurrences: int = 0
     evaluated: int = 0
     wins: int = 0
+    filtered: int = 0
 
     def add(self, event: BacktestEvent) -> None:
+        if event.outcome == "filtered":
+            self.filtered += 1
+            return
         self.occurrences += 1
         if event.outcome in ("win", "loss"):
             self.evaluated += 1
@@ -375,6 +416,7 @@ def summarize_windows(tallies: list[_Tally]) -> WalkforwardStats:
     return WalkforwardStats(
         windows_evaluated=len(graded),
         total_occurrences=sum(t.occurrences for t in tallies),
+        total_filtered=sum(t.filtered for t in tallies),
         total_evaluated=total_evaluated,
         aggregate_hit_rate=pooled,
         window_hit_rates=rates,
@@ -399,11 +441,14 @@ class BacktestRunner:
         end_date: date,
         forward_window_days: int = 5,
         outcome_threshold_pct: float = 0.01,
+        timeframe: Timeframe = "daily",
     ) -> BacktestReport:
         if forward_window_days < 1:
             raise ValueError("forward_window_days must be >= 1")
         if not tickers:
             raise ValueError("at least one ticker required")
+        if timeframe not in _TIMEFRAMES:
+            raise ValueError(f"timeframe must be one of {_TIMEFRAMES}")
 
         logger.info(
             "backtest starting: {} ticker(s), {} → {}, fwd={}, threshold={:.1%}",
@@ -414,16 +459,17 @@ class BacktestRunner:
         for ticker in tickers:
             ticker = ticker.strip().upper()
             try:
-                history = await self._load_history(ticker, start_date, end_date)
+                history = await self._load_history(ticker, start_date, end_date, timeframe)
+                daily = await self._load_daily_context(ticker, start_date, end_date)
             except Exception:
                 logger.exception("backtest: failed to load history for {}", ticker)
                 continue
             if not history:
-                logger.info("backtest {}: no bars in range, skipping", ticker)
+                logger.info("backtest {}: no {} bars in range, skipping", ticker, timeframe)
                 continue
 
             ticker_events = self._replay_one(
-                ticker, history, forward_window_days, outcome_threshold_pct,
+                ticker, history, daily, forward_window_days, outcome_threshold_pct, timeframe,
             )
             events.extend(ticker_events)
             logger.info(
@@ -441,6 +487,7 @@ class BacktestRunner:
             rules=rules,
             total_events=len(events),
             generated_at=datetime.now(timezone.utc),
+            timeframe=timeframe,
         )
         logger.info(
             "backtest complete: {} total events across {} ticker(s)",
@@ -450,8 +497,8 @@ class BacktestRunner:
             if rs.evaluated == 0:
                 continue
             logger.info(
-                "  {}: occ={} eval={} wins={} hit_rate={:.1%} suggested_conf={:.2f}{}",
-                rs.rule_name, rs.occurrences, rs.evaluated, rs.wins,
+                "  {}: occ={} filtered={} eval={} wins={} hit_rate={:.1%} suggested_conf={:.2f}{}",
+                rs.rule_name, rs.occurrences, rs.filtered, rs.evaluated, rs.wins,
                 rs.hit_rate, rs.suggested_confidence,
                 " (low sample)" if rs.sample_size_warning else "",
             )
@@ -467,6 +514,7 @@ class BacktestRunner:
         step_months: int = 1,
         forward_window_days: int = 5,
         outcome_threshold_pct: float = 0.01,
+        timeframe: Timeframe = "daily",
     ) -> WalkforwardReport:
         """Out-of-sample hit rates per rolling test window, aggregated per rule.
 
@@ -481,6 +529,8 @@ class BacktestRunner:
             raise ValueError("train_window_months, test_window_months and step_months must be >= 1")
         if not tickers:
             raise ValueError("at least one ticker required")
+        if timeframe not in _TIMEFRAMES:
+            raise ValueError(f"timeframe must be one of {_TIMEFRAMES}")
         windows = walkforward_windows(
             start_date, end_date, train_window_months, test_window_months, step_months,
         )
@@ -501,19 +551,22 @@ class BacktestRunner:
         tallies: dict[tuple[str, str], list[_Tally | None]] = {}
         for ticker in symbols:
             try:
-                history = await self._load_history(ticker, start_date, end_date)
+                history = await self._load_history(ticker, start_date, end_date, timeframe)
+                daily = await self._load_daily_context(ticker, start_date, end_date)
             except Exception:
                 logger.exception("walk-forward: failed to load history for {}", ticker)
                 continue
             if not history:
-                logger.info("walk-forward {}: no daily bars in range, skipping", ticker)
+                logger.info("walk-forward {}: no {} bars in range, skipping", ticker, timeframe)
                 continue
             first_day = history[0].timestamp.date()
             eligible = [
                 first_day <= w.train_start + timedelta(days=_TRAIN_COVERAGE_SLACK_DAYS)
                 for w in windows
             ]
-            events = self._replay_one(ticker, history, forward_window_days, outcome_threshold_pct)
+            events = self._replay_one(
+                ticker, history, daily, forward_window_days, outcome_threshold_pct, timeframe,
+            )
             for rule in SIGNAL_CATEGORIES:
                 row: list[_Tally | None] = [_Tally() if ok else None for ok in eligible]
                 for e in events:
@@ -542,8 +595,9 @@ class BacktestRunner:
                         pooled[idx].occurrences += tally.occurrences
                         pooled[idx].evaluated += tally.evaluated
                         pooled[idx].wins += tally.wins
+                        pooled[idx].filtered += tally.filtered
                 own = [t for t in row if t is not None]
-                if sum(t.occurrences for t in own):
+                if sum(t.occurrences + t.filtered for t in own):
                     by_ticker[ticker] = WalkforwardTickerStats(
                         **asdict(summarize_windows(own)), ticker=ticker,
                     )
@@ -563,13 +617,14 @@ class BacktestRunner:
             rules=rules,
             tickers=symbols,
             generated_at=datetime.now(timezone.utc),
+            timeframe=timeframe,
         )
         for rs in rules:
             if rs.total_evaluated == 0:
                 continue
             logger.info(
-                "  {}: windows={} eval={} pooled={:.1%} mean={:.1%} std={:.1%} stability={:.2f} suggested_conf={:.2f}{}",
-                rs.rule_name, rs.windows_evaluated, rs.total_evaluated, rs.aggregate_hit_rate,
+                "  {}: windows={} filtered={} eval={} pooled={:.1%} mean={:.1%} std={:.1%} stability={:.2f} suggested_conf={:.2f}{}",
+                rs.rule_name, rs.windows_evaluated, rs.total_filtered, rs.total_evaluated, rs.aggregate_hit_rate,
                 rs.hit_rate_mean, rs.hit_rate_std, rs.stability_score, rs.suggested_confidence,
                 " (low sample)" if rs.sample_size_warning else "",
             )
@@ -579,28 +634,40 @@ class BacktestRunner:
         self,
         ticker: str,
         history: list[HistoryBar],
+        daily: list[DailyBar],
         forward_window_days: int,
         threshold: float,
+        timeframe: Timeframe = "daily",
     ) -> list[BacktestEvent]:
+        """Every rule firing in `history`, graded `forward_window_days` trading
+        days later, after the same daily-trend confirmation live applies."""
         events: list[BacktestEvent] = []
         n = len(history)
+        timestamps = [b.timestamp for b in history]
         for i in range(n):
-            visible = history[: i + 1]
-            fired = evaluate_rules(visible)
+            # A rule reads at most the breakout lookback plus the current bar.
+            fired = evaluate_rules(history[max(0, i - _BREAKOUT_LOOKBACK): i + 1])
             if not fired:
                 continue
-            signal_bar = visible[-1]
-            forward_idx = i + forward_window_days
-            has_forward = forward_idx < n
-            forward_close = history[forward_idx].close if has_forward else None
+            signal_bar = history[i]
+            if timeframe == "daily":
+                forward_idx = i + forward_window_days
+            else:
+                target = _add_trading_days(signal_bar.timestamp, forward_window_days)
+                forward_idx = bisect.bisect_left(timestamps, target)
+            forward_close = history[forward_idx].close if forward_idx < n else None
+            daily_trend = trend_from_bar(
+                last_completed_bar(daily, signal_bar.timestamp), signal_bar.timestamp.date(),
+            )
 
             for rule in fired:
+                fwd = None
                 if rule in _PORTFOLIO_RULES:
                     rule_outcome = "skipped"
-                    fwd = None
-                elif not has_forward:
+                elif decide(rule, daily_trend) is Decision.FILTERED:
+                    rule_outcome = "filtered"
+                elif forward_close is None:
                     rule_outcome = "insufficient_data"
-                    fwd = None
                 else:
                     fwd = forward_close
                     rule_outcome = _classify(rule, signal_bar.close, fwd, threshold)
@@ -614,8 +681,17 @@ class BacktestRunner:
                 ))
         return events
 
+    async def _load_daily_context(self, ticker: str, start_date: date, end_date: date) -> list[DailyBar]:
+        """Daily bars for confirmation, from a little before start_date so the
+        first signals have a previous completed day to be judged on."""
+        bars = await self._load_history(ticker, start_date - timedelta(days=15), end_date, "daily")
+        return [
+            DailyBar(day=b.timestamp.date(), close=b.close, ema_9=b.ema_9, ema_21=b.ema_21, rsi_14=b.rsi_14)
+            for b in bars
+        ]
+
     async def _load_history(
-        self, ticker: str, start_date: date, end_date: date,
+        self, ticker: str, start_date: date, end_date: date, timeframe: Timeframe = "daily",
     ) -> list[HistoryBar]:
         start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
         end_dt = datetime.combine(end_date, datetime.max.time(), tzinfo=timezone.utc)
@@ -653,9 +729,9 @@ class BacktestRunner:
             ts = r.timestamp
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-            # Daily bars only: the backfill stamps them at UTC midnight. Mixing
-            # in 5-minute bars would make the forward window minutes, not days.
-            if ts.timetz() != time(0, tzinfo=timezone.utc):
+            # One timeframe per series: daily bars (stamped at UTC midnight by
+            # the backfill) or the 5-minute bars between them, never both.
+            if is_daily(ts) != (timeframe == "daily"):
                 continue
             out.append(HistoryBar(
                 timestamp=ts,

@@ -1,6 +1,14 @@
-"""Signal evaluation: entry/exit/risk rules over price+indicator+position state."""
-from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+"""Signal evaluation: entry/exit/risk rules over price+indicator+position state.
+
+Entry/exit rules run on the 5-minute series. Before a signal is recorded it
+must be confirmed by the daily trend (src/signals/confirmation.py): long
+entries need a daily uptrend, exits a daily downtrend; stop-loss and risk
+alerts always fire. Filtered-vs-fired counts are kept for GET /health.
+"""
+from collections import deque
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, time, timedelta, timezone
 
 import pandas as pd
 from loguru import logger
@@ -9,6 +17,18 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from src.backtest import confidence_config
 from src.models import Indicator, Position, PriceBar, Signal
+from src.signals.confirmation import (
+    CONFIRMATION_RULES,  # re-exported: the per-rule confirmation policy
+    MAX_STALE_TRADING_DAYS,
+    DailyBar,
+    DailyTrend,
+    Decision,
+    decide,
+    is_daily,
+    reasoning_note,
+    required_trend,
+    trend_from_bar,
+)
 
 
 def _conf(rule_name: str, ticker: str | None = None, fallback: float = 0.5) -> float:
@@ -36,6 +56,81 @@ SIGNAL_CATEGORIES: dict[str, str] = {
 
 def signal_types_for_category(category: str) -> list[str]:
     return [k for k, v in SIGNAL_CATEGORIES.items() if v == category]
+
+
+# Calendar days to look back for the last completed daily bar: enough to span
+# MAX_STALE_TRADING_DAYS plus a weekend and a holiday.
+_DAILY_LOOKBACK_DAYS = MAX_STALE_TRADING_DAYS + 5
+
+
+async def get_daily_trend(conn: AsyncConnection, ticker: str, as_of: datetime) -> DailyTrend:
+    """The daily trend a signal at `as_of` is confirmed against: the most recent
+    daily bar from a trading day *before* as_of's (the same day's bar already
+    holds that day's close), or "unknown" if there is none recent enough."""
+    as_of = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
+    signal_day = as_of.astimezone(timezone.utc).date()
+    # Daily bars sit exactly at midnight UTC, so ask for those instants by
+    # value: portable, and it skips the intraday bars in between.
+    midnights = [
+        datetime.combine(signal_day - timedelta(days=n), time(0), tzinfo=timezone.utc)
+        for n in range(1, _DAILY_LOOKBACK_DAYS + 1)
+    ]
+    stmt = (
+        select(PriceBar.timestamp, PriceBar.close, Indicator.ema_9, Indicator.ema_21, Indicator.rsi_14)
+        .outerjoin(
+            Indicator,
+            and_(PriceBar.ticker == Indicator.ticker, PriceBar.timestamp == Indicator.timestamp),
+        )
+        .where(PriceBar.ticker == ticker, PriceBar.timestamp.in_(midnights))
+        .order_by(PriceBar.timestamp.desc())
+        .limit(1)
+    )
+    row = (await conn.execute(stmt)).first()
+    bar = None
+    if row is not None:
+        bar = DailyBar(
+            day=_ts(row.timestamp).date(), close=float(row.close),
+            ema_9=row.ema_9, ema_21=row.ema_21, rsi_14=row.rsi_14,
+        )
+    daily = trend_from_bar(bar, signal_day)
+    if daily.trend == "unknown":
+        logger.warning(
+            "{}: no daily trend for {} ({}); signals fire unconfirmed",
+            ticker, signal_day, daily.reason or f"none in the last {_DAILY_LOOKBACK_DAYS} days",
+        )
+    return daily
+
+
+class FilterStats:
+    """Fired vs filtered counts for confirmation-gated rules, last 24 hours.
+
+    In memory: counts start from zero when the API restarts.
+    """
+
+    WINDOW = timedelta(hours=24)
+
+    def __init__(self, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+        self._clock = clock
+        self._events: deque[tuple[datetime, str, bool]] = deque()
+
+    def record(self, rule: str, fired: bool) -> None:
+        self._events.append((self._clock(), rule, fired))
+
+    def last_24h(self) -> dict[str, dict[str, float]]:
+        cutoff = self._clock() - self.WINDOW
+        while self._events and self._events[0][0] < cutoff:
+            self._events.popleft()
+        counts: dict[str, list[int]] = {}
+        for _, rule, fired in self._events:
+            tally = counts.setdefault(rule, [0, 0])
+            tally[0 if fired else 1] += 1
+        return {
+            rule: {"fired": fired, "filtered": filtered, "filter_rate": round(filtered / (fired + filtered), 2)}
+            for rule, (fired, filtered) in sorted(counts.items())
+        }
+
+
+FILTER_STATS = FilterStats()
 
 
 @dataclass
@@ -93,17 +188,41 @@ class SignalEngine:
     BREAKOUT_LOOKBACK = 20
     PORTFOLIO_SENTINEL = "PORTFOLIO"
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(self, engine: AsyncEngine, stats: FilterStats = FILTER_STATS) -> None:
         self._engine = engine
+        self._stats = stats
 
     async def evaluate(self, ticker: str) -> list[dict]:
+        """Candidates that would be recorded now (confirmed), without recording them."""
         ticker = ticker.strip().upper()
         async with self._engine.connect() as conn:
             history = await self._load_history(conn, ticker, self.HISTORY_LIMIT)
             position = await self._load_position(conn, ticker)
             portfolio = await self._load_portfolio(conn)
-        candidates = self._build_candidates(ticker, history, position, portfolio)
-        return [asdict(c) for c in candidates]
+            candidates = self._build_candidates(ticker, history, position, portfolio)
+            confirmed = [c for c, _ in [await self._confirm(conn, c) for c in candidates] if c is not None]
+        return [asdict(c) for c in confirmed]
+
+    async def _confirm(
+        self, conn: AsyncConnection, candidate: SignalCandidate
+    ) -> tuple[SignalCandidate | None, Decision]:
+        """Gate a candidate on the daily trend. None means filtered out."""
+        if required_trend(candidate.signal_type) is None:
+            return candidate, Decision.NOT_REQUIRED
+        daily = await get_daily_trend(conn, candidate.ticker, candidate.timestamp)
+        decision = decide(candidate.signal_type, daily)
+        if decision is Decision.FILTERED:
+            logger.debug(
+                "{} {}: filtered by daily trend confirmation (daily {}, needs {})",
+                candidate.ticker, candidate.signal_type, daily.trend, required_trend(candidate.signal_type),
+            )
+            return None, decision
+        if decision is Decision.UNCONFIRMED:
+            logger.info("{} {}: unconfirmed — no daily data", candidate.ticker, candidate.signal_type)
+        note = reasoning_note(daily, decision)
+        if note:
+            candidate = replace(candidate, reasoning=f"{candidate.reasoning.rstrip()} {note}")
+        return candidate, decision
 
     async def run_all(self, tickers: list[str]) -> list[dict]:
         inserted: list[dict] = []
@@ -118,6 +237,12 @@ class SignalEngine:
                 candidates = self._build_candidates(ticker, history, position, portfolio)
 
                 for c in candidates:
+                    confirmed, decision = await self._confirm(conn, c)
+                    if confirmed is None:
+                        self._stats.record(c.signal_type, fired=False)
+                        continue
+                    c = confirmed
+
                     # Portfolio-wide signals: emit once per run regardless of carrier ticker.
                     if SIGNAL_CATEGORIES.get(c.signal_type) == "risk" and c.signal_type == "drawdown_alert":
                         if c.signal_type in emitted_portfolio:
@@ -135,6 +260,8 @@ class SignalEngine:
 
                     res = await conn.execute(insert(Signal).values(**c.to_row()))
                     sig_id = res.inserted_primary_key[0]
+                    if decision is not Decision.NOT_REQUIRED:
+                        self._stats.record(c.signal_type, fired=True)
                     inserted.append({**asdict(c), "id": sig_id})
                     logger.info(
                         "signal: {} {} ({:.2f}) — {}",
@@ -348,9 +475,11 @@ class SignalEngine:
             )
             .where(PriceBar.ticker == ticker)
             .order_by(PriceBar.timestamp.desc())
-            .limit(limit)
+            .limit(limit * 3)
         )
-        rows = (await conn.execute(stmt)).all()
+        # Rules run on the 5-minute series; daily bars are confirmation context
+        # (get_daily_trend), not the previous bar. Over-fetch, they get skipped.
+        rows = [r for r in (await conn.execute(stmt)).all() if not is_daily(_ts(r.timestamp))][:limit]
         if not rows:
             return pd.DataFrame()
         records = [

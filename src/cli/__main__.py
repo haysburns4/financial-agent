@@ -2,6 +2,7 @@
 
     ./start                  # set up if needed, then run the API and web UI
     ./start --dev            # same, with `next dev` instead of a production build
+    ./start --backfill [5y]  # also refresh price history and recalibrate signal confidence
     ./start login            # E-Trade login against a running API (daily); or use the
                              # "Log in to E-Trade" button in the dashboard
     ./start setup [--all]    # ask for whatever .env is missing (or everything)
@@ -49,6 +50,12 @@ def _parser() -> argparse.ArgumentParser:
     start = commands.add_parser("start", parents=[common], help="run the app (default)")
     start.add_argument("--dev", action="store_true", help="run the web UI with `next dev`")
     start.add_argument("--no-browser", action="store_true", help="don't open the dashboard")
+    start.add_argument(
+        "--backfill", nargs="?", const="1mo", default=None, metavar="PERIOD",
+        help="refresh price history from Yahoo at startup (PERIOD of daily bars, default 1mo; "
+        "e.g. 5y the first time, plus the last 60 days of 5-minute bars), then recalibrate "
+        "signal confidence from a walk-forward backtest",
+    )
     login_cmd = commands.add_parser(
         "login",
         help="log in to E-Trade against the running API (the dashboard's \"Log in to E-Trade\" button does the same)",
@@ -117,7 +124,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ROOT, prompter, LiveSystem(), network, os.environ,
                     Supervisor(), webbrowser.open, interactive,
                 )
-                return launcher.run(Options(dev=args.dev, open_browser=not args.no_browser))
+                return launcher.run(
+                    Options(dev=args.dev, open_browser=not args.no_browser, backfill=args.backfill)
+                )
             case _:
                 wizard = Wizard(ROOT, prompter, LiveSystem(), network, os.environ, ask_all=args.all)
                 if args.non_interactive:
