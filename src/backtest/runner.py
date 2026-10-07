@@ -9,15 +9,26 @@ review and — via POST /backtest/apply — push back into
 [src/backtest/confidence_config.py](src/backtest/confidence_config.py) as
 the calibrated confidence weight used by the live signal engine.
 
+`run_walkforward` is the more honest variant: it splits the range into
+rolling train/test windows and reports each rule's out-of-sample hit rate per
+test window, how much that swings between windows, and a suggested confidence
+discounted for the swing. Rules are fixed, not fitted, so the train window
+only guarantees the ticker had enough history for its indicators to settle.
+
+Replays read daily bars only (the backfill stamps them at UTC midnight), so
+`forward_window_days` means trading days rather than 5-minute bars.
+
 This module deliberately re-implements rule evaluation against a list of
 Row objects instead of reusing `SignalEngine._entry_signals` /
 `_exit_signals` (which take a pandas DataFrame and would push us toward
 loading per-bar history from the DB). Keeping a local `evaluate_rules`
 makes the no-lookahead slicing explicit and self-contained.
 """
+import calendar
 import statistics
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from loguru import logger
@@ -35,6 +46,16 @@ _CONFIDENCE_CEILING = 0.95
 _PORTFOLIO_RULES = {"concentration_risk", "drawdown_alert", "stop_loss_warning"}
 _ENTRY_RULES = {"oversold_reversal", "golden_cross", "breakout"}
 _EXIT_RULES = {"overbought_reversal", "death_cross"}
+
+# Walk-forward
+_MIN_WINDOW_OCCURRENCES = 20
+# How hard instability (std/mean of per-window hit rates) discounts confidence:
+# a rule whose hit rate swings wildly loses up to 30% of its pooled hit rate.
+_STABILITY_WEIGHT = 0.3
+# A ticker counts in a window only if its history starts by train_start (plus
+# this slack for weekends/holidays), so its indicators had the train window to
+# warm up.
+_TRAIN_COVERAGE_SLACK_DAYS = 7
 
 
 @dataclass
@@ -64,6 +85,17 @@ class BacktestEvent:
 
 
 @dataclass
+class TickerRuleStats:
+    """One rule's single-window result for one ticker."""
+
+    occurrences: int
+    evaluated: int
+    wins: int
+    hit_rate: float | None
+    suggested_confidence: float
+
+
+@dataclass
 class RuleStats:
     rule_name: str
     occurrences: int
@@ -74,6 +106,7 @@ class RuleStats:
     avg_forward_return: float
     suggested_confidence: float
     sample_size_warning: bool
+    by_ticker: dict[str, TickerRuleStats] = field(default_factory=dict)
 
 
 @dataclass
@@ -85,6 +118,62 @@ class BacktestReport:
     outcome_threshold_pct: float
     rules: list[RuleStats]
     total_events: int
+    generated_at: datetime
+
+
+@dataclass
+class WalkforwardWindow:
+    """Half-open windows: [train_start, train_end) then [test_start, test_end)."""
+
+    train_start: date
+    train_end: date
+    test_start: date
+    test_end: date
+
+
+@dataclass
+class WalkforwardStats:
+    """Out-of-sample results across test windows. Hit-rate fields are None when
+    nothing was graded; `window_hit_rates` covers only windows with graded
+    events, in chronological order."""
+
+    windows_evaluated: int
+    total_occurrences: int
+    total_evaluated: int
+    aggregate_hit_rate: float | None  # pooled: total wins / total evaluated
+    window_hit_rates: list[float]
+    hit_rate_mean: float | None
+    hit_rate_std: float | None  # population std of window_hit_rates
+    hit_rate_min: float | None
+    hit_rate_max: float | None
+    stability_score: float | None  # 1 - std/mean, clamped to [0, 1]
+    sample_size_warning: bool  # any window with < 20 occurrences
+    suggested_confidence: float
+
+
+@dataclass
+class WalkforwardTickerStats(WalkforwardStats):
+    ticker: str = ""
+
+
+@dataclass
+class WalkforwardRuleStats(WalkforwardStats):
+    rule_name: str = ""
+    by_ticker: dict[str, WalkforwardTickerStats] = field(default_factory=dict)
+
+
+@dataclass
+class WalkforwardReport:
+    start_date: date
+    end_date: date
+    train_window_months: int
+    test_window_months: int
+    step_months: int
+    forward_window_days: int
+    outcome_threshold_pct: float
+    windows: list[WalkforwardWindow]
+    rules: list[WalkforwardRuleStats]
+    tickers: list[str]
     generated_at: datetime
 
 
@@ -152,6 +241,23 @@ def _classify(rule: str, signal_close: float, forward_close: float, threshold: f
     return "skipped"
 
 
+def _clamp_confidence(value: float) -> float:
+    return max(_CONFIDENCE_FLOOR, min(_CONFIDENCE_CEILING, value))
+
+
+def _ticker_rule_stats(events: list[BacktestEvent]) -> TickerRuleStats:
+    evaluable = [e for e in events if e.outcome in ("win", "loss")]
+    wins = sum(e.outcome == "win" for e in evaluable)
+    hit_rate = wins / len(evaluable) if evaluable else None
+    return TickerRuleStats(
+        occurrences=len(events),
+        evaluated=len(evaluable),
+        wins=wins,
+        hit_rate=hit_rate,
+        suggested_confidence=_CONFIDENCE_FLOOR if hit_rate is None else _clamp_confidence(hit_rate),
+    )
+
+
 def _aggregate(events: list[BacktestEvent]) -> list[RuleStats]:
     stats: list[RuleStats] = []
     # Include every known rule so the report shape is stable even when a rule
@@ -174,6 +280,10 @@ def _aggregate(events: list[BacktestEvent]) -> list[RuleStats]:
         else:
             suggested = max(_CONFIDENCE_FLOOR, min(_CONFIDENCE_CEILING, hit_rate))
 
+        by_ticker: dict[str, list[BacktestEvent]] = defaultdict(list)
+        for e in rule_events:
+            by_ticker[e.ticker].append(e)
+
         stats.append(RuleStats(
             rule_name=rule,
             occurrences=len(rule_events),
@@ -184,8 +294,98 @@ def _aggregate(events: list[BacktestEvent]) -> list[RuleStats]:
             avg_forward_return=avg_forward_return,
             suggested_confidence=suggested,
             sample_size_warning=len(evaluable) < _MIN_EVALUATED_SAMPLES,
+            by_ticker={t: _ticker_rule_stats(es) for t, es in sorted(by_ticker.items())},
         ))
     return stats
+
+
+# ---------- walk-forward ----------
+
+
+def _add_months(d: date, months: int) -> date:
+    """`d` moved by whole months, clamped to the target month's last day."""
+    year, month0 = divmod(d.month - 1 + months, 12)
+    year += d.year
+    day = min(d.day, calendar.monthrange(year, month0 + 1)[1])
+    return date(year, month0 + 1, day)
+
+
+def walkforward_windows(
+    start_date: date,
+    end_date: date,
+    train_window_months: int,
+    test_window_months: int,
+    step_months: int,
+) -> list[WalkforwardWindow]:
+    """Rolling windows from start_date, stepping until a test window would end
+    after end_date.
+
+    Every boundary is an offset from start_date itself, not from the previous
+    boundary: chaining month additions drifts after a clamp (Jan 31 -> Feb 28
+    -> Mar 28) and would leave days between consecutive test windows.
+    """
+    windows: list[WalkforwardWindow] = []
+    i = 0
+    while True:
+        offset = step_months * i
+        train_start = _add_months(start_date, offset)
+        train_end = _add_months(start_date, offset + train_window_months)
+        test_end = _add_months(start_date, offset + train_window_months + test_window_months)
+        if test_end > end_date:
+            return windows
+        windows.append(WalkforwardWindow(train_start, train_end, train_end, test_end))
+        i += 1
+
+
+@dataclass
+class _Tally:
+    occurrences: int = 0
+    evaluated: int = 0
+    wins: int = 0
+
+    def add(self, event: BacktestEvent) -> None:
+        self.occurrences += 1
+        if event.outcome in ("win", "loss"):
+            self.evaluated += 1
+            self.wins += event.outcome == "win"
+
+
+def summarize_windows(tallies: list[_Tally]) -> WalkforwardStats:
+    """Aggregate one rule's per-window tallies (chronological) into stats."""
+    graded = [t for t in tallies if t.evaluated > 0]
+    rates = [t.wins / t.evaluated for t in graded]
+    total_evaluated = sum(t.evaluated for t in tallies)
+    pooled = sum(t.wins for t in tallies) / total_evaluated if total_evaluated else None
+
+    mean = statistics.fmean(rates) if rates else None
+    std = statistics.pstdev(rates) if rates else None
+    if mean is None or std is None:
+        stability = None
+    elif mean == 0:
+        stability = 0.0  # never right in any window: nothing stable to trust
+    else:
+        stability = max(0.0, min(1.0, 1 - std / mean))
+
+    if pooled is None or stability is None:
+        suggested = _CONFIDENCE_FLOOR  # No data; apply won't use it.
+    else:
+        # A stable 65% rule should outrank a 75% rule that swings by regime.
+        suggested = _clamp_confidence(pooled * (1 - _STABILITY_WEIGHT * (1 - stability)))
+
+    return WalkforwardStats(
+        windows_evaluated=len(graded),
+        total_occurrences=sum(t.occurrences for t in tallies),
+        total_evaluated=total_evaluated,
+        aggregate_hit_rate=pooled,
+        window_hit_rates=rates,
+        hit_rate_mean=mean,
+        hit_rate_std=std,
+        hit_rate_min=min(rates) if rates else None,
+        hit_rate_max=max(rates) if rates else None,
+        stability_score=stability,
+        sample_size_warning=any(t.occurrences < _MIN_WINDOW_OCCURRENCES for t in tallies),
+        suggested_confidence=suggested,
+    )
 
 
 class BacktestRunner:
@@ -253,6 +453,124 @@ class BacktestRunner:
                 "  {}: occ={} eval={} wins={} hit_rate={:.1%} suggested_conf={:.2f}{}",
                 rs.rule_name, rs.occurrences, rs.evaluated, rs.wins,
                 rs.hit_rate, rs.suggested_confidence,
+                " (low sample)" if rs.sample_size_warning else "",
+            )
+        return report
+
+    async def run_walkforward(
+        self,
+        tickers: list[str],
+        start_date: date,
+        end_date: date,
+        train_window_months: int = 12,
+        test_window_months: int = 1,
+        step_months: int = 1,
+        forward_window_days: int = 5,
+        outcome_threshold_pct: float = 0.01,
+    ) -> WalkforwardReport:
+        """Out-of-sample hit rates per rolling test window, aggregated per rule.
+
+        Each ticker is replayed once over the whole range — a rule at bar i
+        sees only bars [0..i], so that is the same as replaying per window —
+        and every event is then credited to the test window its signal bar
+        falls in. Grading may read bars past test_end; the rule never does.
+        """
+        if forward_window_days < 1:
+            raise ValueError("forward_window_days must be >= 1")
+        if min(train_window_months, test_window_months, step_months) < 1:
+            raise ValueError("train_window_months, test_window_months and step_months must be >= 1")
+        if not tickers:
+            raise ValueError("at least one ticker required")
+        windows = walkforward_windows(
+            start_date, end_date, train_window_months, test_window_months, step_months,
+        )
+        if not windows:
+            raise ValueError(
+                f"{start_date} → {end_date} is too short for one window of "
+                f"{train_window_months} train + {test_window_months} test month(s)"
+            )
+        symbols = [t.strip().upper() for t in tickers]
+        logger.info(
+            "walk-forward starting: {} ticker(s), {} → {}, {} window(s) of {}m train / {}m test, step {}m",
+            len(symbols), start_date, end_date, len(windows),
+            train_window_months, test_window_months, step_months,
+        )
+
+        # tallies[(rule, ticker)][window index]; None where the ticker lacked
+        # history covering that window's train period.
+        tallies: dict[tuple[str, str], list[_Tally | None]] = {}
+        for ticker in symbols:
+            try:
+                history = await self._load_history(ticker, start_date, end_date)
+            except Exception:
+                logger.exception("walk-forward: failed to load history for {}", ticker)
+                continue
+            if not history:
+                logger.info("walk-forward {}: no daily bars in range, skipping", ticker)
+                continue
+            first_day = history[0].timestamp.date()
+            eligible = [
+                first_day <= w.train_start + timedelta(days=_TRAIN_COVERAGE_SLACK_DAYS)
+                for w in windows
+            ]
+            events = self._replay_one(ticker, history, forward_window_days, outcome_threshold_pct)
+            for rule in SIGNAL_CATEGORIES:
+                row: list[_Tally | None] = [_Tally() if ok else None for ok in eligible]
+                for e in events:
+                    if e.rule_name != rule:
+                        continue
+                    day = e.signal_bar_timestamp.date()
+                    for idx, w in enumerate(windows):
+                        tally = row[idx]
+                        if tally is not None and w.test_start <= day < w.test_end:
+                            tally.add(e)
+                tallies[(rule, ticker)] = row
+            logger.info(
+                "walk-forward {}: {} bars, {} events, in {}/{} window(s)",
+                ticker, len(history), len(events), sum(eligible), len(windows),
+            )
+
+        rules: list[WalkforwardRuleStats] = []
+        for rule in SIGNAL_CATEGORIES:
+            pooled = [_Tally() for _ in windows]
+            by_ticker: dict[str, WalkforwardTickerStats] = {}
+            for (name, ticker), row in sorted(tallies.items()):
+                if name != rule:
+                    continue
+                for idx, tally in enumerate(row):
+                    if tally is not None:
+                        pooled[idx].occurrences += tally.occurrences
+                        pooled[idx].evaluated += tally.evaluated
+                        pooled[idx].wins += tally.wins
+                own = [t for t in row if t is not None]
+                if sum(t.occurrences for t in own):
+                    by_ticker[ticker] = WalkforwardTickerStats(
+                        **asdict(summarize_windows(own)), ticker=ticker,
+                    )
+            rules.append(WalkforwardRuleStats(
+                **asdict(summarize_windows(pooled)), rule_name=rule, by_ticker=by_ticker,
+            ))
+
+        report = WalkforwardReport(
+            start_date=start_date,
+            end_date=end_date,
+            train_window_months=train_window_months,
+            test_window_months=test_window_months,
+            step_months=step_months,
+            forward_window_days=forward_window_days,
+            outcome_threshold_pct=outcome_threshold_pct,
+            windows=windows,
+            rules=rules,
+            tickers=symbols,
+            generated_at=datetime.now(timezone.utc),
+        )
+        for rs in rules:
+            if rs.total_evaluated == 0:
+                continue
+            logger.info(
+                "  {}: windows={} eval={} pooled={:.1%} mean={:.1%} std={:.1%} stability={:.2f} suggested_conf={:.2f}{}",
+                rs.rule_name, rs.windows_evaluated, rs.total_evaluated, rs.aggregate_hit_rate,
+                rs.hit_rate_mean, rs.hit_rate_std, rs.stability_score, rs.suggested_confidence,
                 " (low sample)" if rs.sample_size_warning else "",
             )
         return report
@@ -335,6 +653,10 @@ class BacktestRunner:
             ts = r.timestamp
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
+            # Daily bars only: the backfill stamps them at UTC midnight. Mixing
+            # in 5-minute bars would make the forward window minutes, not days.
+            if ts.timetz() != time(0, tzinfo=timezone.utc):
+                continue
             out.append(HistoryBar(
                 timestamp=ts,
                 open=float(r.open), high=float(r.high), low=float(r.low),

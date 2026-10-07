@@ -45,6 +45,12 @@ class BacktestRequest(BaseModel):
     outcome_threshold_pct: float = 0.01
 
 
+class WalkforwardRequest(BacktestRequest):
+    train_window_months: int = 12
+    test_window_months: int = 1
+    step_months: int = 1
+
+
 class ChatTurn(BaseModel):
     role: str  # "user" | "assistant"
     content: str
@@ -377,20 +383,48 @@ def create_app() -> FastAPI:
             forward_window_days=body.forward_window_days,
             outcome_threshold_pct=body.outcome_threshold_pct,
         )
-        backtest_persistence.save_report(report)
+        backtest_persistence.STORE.save_report(report)
         return asdict(report)
 
     @app.get("/backtest/latest")
     async def latest_backtest():
-        report = backtest_persistence.load_report_json()
+        report = backtest_persistence.STORE.load_report_json()
         if report is None:
             raise HTTPException(status_code=404, detail="no backtest report on disk")
         return report
 
+    @app.post("/backtest/walkforward/run")
+    async def trigger_walkforward(body: WalkforwardRequest):
+        tickers = body.tickers or await monitored_tickers(engine)
+        try:
+            report = await BacktestRunner(engine).run_walkforward(
+                tickers=tickers,
+                start_date=body.start_date,
+                end_date=body.end_date,
+                train_window_months=body.train_window_months,
+                test_window_months=body.test_window_months,
+                step_months=body.step_months,
+                forward_window_days=body.forward_window_days,
+                outcome_threshold_pct=body.outcome_threshold_pct,
+            )
+        except ValueError as exc:
+            # Bad windowing (e.g. range shorter than one train + test span).
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        backtest_persistence.STORE.save_walkforward_report(report)
+        return asdict(report)
+
+    @app.get("/backtest/walkforward/latest")
+    async def latest_walkforward():
+        report = backtest_persistence.STORE.load_walkforward_json()
+        if report is None:
+            raise HTTPException(status_code=404, detail="no walk-forward report on disk")
+        return report
+
     @app.post("/backtest/apply")
     async def apply_backtest():
+        """Calibrate from the newer of the two reports; `source` says which."""
         try:
-            return backtest_persistence.apply_latest_report()
+            return backtest_persistence.STORE.apply_latest_report()
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

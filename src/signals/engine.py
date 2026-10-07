@@ -11,10 +11,15 @@ from src.backtest import confidence_config
 from src.models import Indicator, Position, PriceBar, Signal
 
 
-def _conf(rule_name: str, fallback: float = 0.5) -> float:
-    """Look up the current calibrated weight for a rule. Read by attribute so
-    POST /backtest/apply takes effect immediately (no module reload needed)."""
-    return confidence_config.CONFIDENCE_WEIGHTS.get(rule_name, fallback)
+def _conf(rule_name: str, ticker: str | None = None, fallback: float = 0.5) -> float:
+    """Look up the current calibrated weight for a rule: the ticker's override
+    when calibration wrote one, otherwise the rule's `_default`. Read by
+    attribute so POST /backtest/apply takes effect immediately (no reload)."""
+    weights = confidence_config.CONFIDENCE_WEIGHTS
+    override = weights.get(ticker, {}).get(rule_name) if ticker else None
+    if override is not None:
+        return override
+    return weights.get("_default", {}).get(rule_name, fallback)
 
 
 SIGNAL_CATEGORIES: dict[str, str] = {
@@ -177,7 +182,7 @@ class SignalEngine:
                 out.append(SignalCandidate(
                     ticker=ticker, timestamp=ts,
                     signal_type="oversold_reversal", direction="long",
-                    confidence=_conf("oversold_reversal"),
+                    confidence=_conf("oversold_reversal", ticker),
                     reasoning=(
                         f"RSI={rsi:.1f} (<30), MACD histogram flipped positive "
                         f"({hist_prev:.3f} → {hist_now:.3f})"
@@ -192,7 +197,7 @@ class SignalEngine:
                 out.append(SignalCandidate(
                     ticker=ticker, timestamp=ts,
                     signal_type="golden_cross", direction="long",
-                    confidence=_conf("golden_cross"),
+                    confidence=_conf("golden_cross", ticker),
                     reasoning=f"EMA9 ({e9:.2f}) crossed above EMA21 ({e21:.2f})",
                 ))
 
@@ -207,7 +212,7 @@ class SignalEngine:
                 out.append(SignalCandidate(
                     ticker=ticker, timestamp=ts,
                     signal_type="breakout", direction="long",
-                    confidence=_conf("breakout"),
+                    confidence=_conf("breakout", ticker),
                     reasoning=(
                         f"Close {last_close:.2f} > {self.BREAKOUT_LOOKBACK}-day high "
                         f"{prior_high:.2f} on volume {last_vol:.0f} (avg {vol_avg:.0f})"
@@ -232,7 +237,7 @@ class SignalEngine:
                 out.append(SignalCandidate(
                     ticker=ticker, timestamp=ts,
                     signal_type="overbought_reversal", direction=None,
-                    confidence=_conf("overbought_reversal"),
+                    confidence=_conf("overbought_reversal", ticker),
                     reasoning=(
                         f"RSI={rsi:.1f} (>70), MACD histogram flipped negative "
                         f"({hist_prev:.3f} → {hist_now:.3f})"
@@ -247,7 +252,7 @@ class SignalEngine:
                 out.append(SignalCandidate(
                     ticker=ticker, timestamp=ts,
                     signal_type="death_cross", direction=None,
-                    confidence=_conf("death_cross"),
+                    confidence=_conf("death_cross", ticker),
                     reasoning=f"EMA9 ({e9:.2f}) crossed below EMA21 ({e21:.2f})",
                 ))
 
@@ -265,7 +270,7 @@ class SignalEngine:
         return [SignalCandidate(
             ticker=ticker, timestamp=ts,
             signal_type="stop_loss_warning", direction=None,
-            confidence=_conf("stop_loss_warning"),
+            confidence=_conf("stop_loss_warning", ticker),
             reasoning=(
                 f"Position P&L {pnl_pct:.1%} "
                 f"(cost ${position['cost_basis']:.0f} → mkt ${position['market_value']:.0f})"
@@ -284,7 +289,7 @@ class SignalEngine:
         return [SignalCandidate(
             ticker=ticker, timestamp=datetime.now(timezone.utc),
             signal_type="concentration_risk", direction=None,
-            confidence=_conf("concentration_risk"),
+            confidence=_conf("concentration_risk", ticker),
             reasoning=(
                 f"{ticker} is {pos_pct:.1%} of portfolio "
                 f"(${position['market_value']:.0f} / ${total_value:.0f})"
