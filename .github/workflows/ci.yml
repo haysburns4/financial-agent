@@ -1,0 +1,111 @@
+# Tests, lint, build and a smoke start on every push to main and every PR.
+# Needs no secrets and makes no E-Trade or LLM calls: every credential below is
+# a dummy, doctor runs --offline, and the API makes no outbound calls at startup.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --frozen --extra dev --extra openai
+      - name: Test
+        run: uv run --frozen pytest
+      - name: Anti-slop
+        run: uv run --frozen python tools/anti_slop.py src tests tools
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    env:
+      COPILOTKIT_TELEMETRY_DISABLED: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Anti-slop
+        run: npm run lint:slop
+      - name: Build
+        run: npm run build
+
+  smoke:
+    needs: python
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ETRADE_CONSUMER_KEY: ci-dummy-consumer-key
+      ETRADE_CONSUMER_SECRET: ci-dummy-consumer-secret
+      LLM_PROVIDER: anthropic
+      ANTHROPIC_API_KEY: ci-dummy
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      # doctor checks for Node >= 20; pin it rather than rely on the runner image.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install
+        run: uv sync --frozen --extra dev --extra openai
+      - name: Doctor
+        run: ./start doctor --non-interactive --offline
+      - name: Start the API and wait for /health
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///${{ runner.temp }}/smoke.db
+          API_PORT: "8000"
+        run: |
+          health="http://127.0.0.1:${API_PORT}/health"
+          # Something already answering would make the check below pass for the wrong process.
+          if curl -fsS "$health" >/dev/null 2>&1; then
+            echo "::error::port ${API_PORT} is already serving; cannot smoke-test"
+            exit 1
+          fi
+          uv run --frozen python -m src.main > "$RUNNER_TEMP/api.log" 2>&1 &
+          pid=$!
+          healthy=false
+          for _ in $(seq 1 30); do
+            kill -0 "$pid" 2>/dev/null || break  # exited early; no point waiting
+            body="$(curl -fsS "$health" 2>/dev/null || true)"
+            if [[ "$body" == *'"status":"ok"'* ]]; then
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" || true
+          if [ "$healthy" != true ]; then
+            echo "::error::API did not report healthy within 30s"
+            cat "$RUNNER_TEMP/api.log"
+            exit 1
+          fi
+          echo "API healthy"

@@ -1,4 +1,4 @@
-# financial-agent
+# financial-agent [![CI](https://github.com/haysburns4/financial-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/haysburns4/financial-agent/actions/workflows/ci.yml)
 
 Automated market data collection, technical signal generation, and portfolio monitoring backed by E-Trade, with a chat agent and web dashboard.
 

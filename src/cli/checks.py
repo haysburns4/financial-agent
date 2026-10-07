@@ -248,7 +248,8 @@ def check_node_modules(web: Path) -> CheckResult:
     name = "web dependencies"
     fix = "run `cd web && npm install`"
     if not (web / "node_modules").is_dir():
-        return fail(name, "web/node_modules is missing", fix)
+        # A warning: ./start installs them itself.
+        return warn(name, "web/node_modules is missing", "`./start` installs them, or run `cd web && npm ci`")
     if node_modules_stale(web):
         return warn(name, "package-lock.json changed since the last install", fix)
     return ok(name, "installed")

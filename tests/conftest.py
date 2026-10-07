@@ -3,6 +3,18 @@
 The point of the provider-neutral layer is that the agent can be tested with
 no vendor SDK, no API key, and no network — `FakeBackend` is the whole seam.
 """
+import os
+
+# src.config builds Settings() at import time, and Settings requires the E-Trade
+# keys, so without a .env (a fresh clone, CI) the suite could not even be
+# collected. Dummy values let it import; nothing in the tests calls E-Trade or an
+# LLM. setdefault, so real values from the shell still win. This must run
+# before anything imports src.
+os.environ.setdefault("ETRADE_CONSUMER_KEY", "test-consumer-key")
+os.environ.setdefault("ETRADE_CONSUMER_SECRET", "test-consumer-secret")
+os.environ.setdefault("LLM_PROVIDER", "anthropic")
+os.environ.setdefault("ANTHROPIC_API_KEY", "test")
+
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 

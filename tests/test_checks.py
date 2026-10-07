@@ -150,7 +150,7 @@ def test_node_version(version, status):
 
 
 def test_node_modules(tmp_path):
-    assert check_node_modules(tmp_path).status is Status.FAIL
+    assert check_node_modules(tmp_path).status is Status.WARN
 
     (tmp_path / "node_modules").mkdir()
     marker = tmp_path / "node_modules" / ".package-lock.json"
@@ -226,8 +226,17 @@ def test_doctor_uses_shell_values_like_the_app_does(tmp_path):
     assert exit_code(results) == 1
 
 
-def test_doctor_without_env_file_fails(tmp_path):
-    assert exit_code(run_doctor(tmp_path, {}, FakeSystem(), None)) == 1
+def test_doctor_without_env_file_fails_when_nothing_is_exported(tmp_path):
+    results = run_doctor(tmp_path, {}, FakeSystem(), None)
+    assert exit_code(results) == 1
+    assert any(r.message == "ETRADE_CONSUMER_KEY is not set" for r in results)
+
+
+def test_doctor_accepts_settings_from_the_environment_alone(tmp_path):
+    environ = {"ETRADE_CONSUMER_KEY": "k", "ETRADE_CONSUMER_SECRET": "s", "ANTHROPIC_API_KEY": "a"}
+    results = run_doctor(tmp_path, environ, FakeSystem(), None)
+    assert exit_code(results) == 0
+    assert any(r.name == ".env" and r.status is Status.WARN for r in results)
 
 
 def test_doctor_requires_the_openai_package_for_openai(tmp_path):

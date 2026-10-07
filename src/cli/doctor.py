@@ -39,15 +39,18 @@ def run_doctor(
     root: Path, environ: Mapping[str, str], system: System, network: NetworkChecks | None
 ) -> list[CheckResult]:
     path = root / ".env"
-    if not path.exists():
+    if path.exists():
+        env = env_values(EnvFile.read(path))
+        results = [checks.check_env_permissions(path)]
+    else:
+        # Settings can come from exported variables alone (CI, containers);
+        # check_settings below fails if that leaves anything required unset.
+        env = {}
         results = [
-            checks.fail(".env", "not found", f"{checks.SETUP_HINT}, or `cp .env.example .env`")
+            checks.warn(".env", "not found; using exported variables only", f"{checks.SETUP_HINT}, or `cp .env.example .env`")
         ]
-        return results + local_checks(root, {}, environ, system)
-
-    env = env_values(EnvFile.read(path))
     values = effective_values(env, environ)
-    results = [checks.check_env_permissions(path), *checks.check_settings(values)]
+    results.extend(checks.check_settings(values))
     if not values.get("TOKEN_ENCRYPTION_KEY"):
         results.append(
             checks.warn(
