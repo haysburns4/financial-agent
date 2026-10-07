@@ -33,6 +33,7 @@ http://127.0.0.1:3000. Ctrl-C stops everything. Later runs skip whatever is alre
 ./start --dev          # web UI with hot reload (`next dev`) instead of a production build
 ./start --no-browser   # don't open the dashboard
 ./start --backfill     # refresh prices, recalibrate, catch up on missed signals (`--backfill 5y` the first time)
+./start --with-local-llm  # also run mlx_lm.server for LLM_PROVIDER=local
 ./start login          # log in to E-Trade again, against the running app
 ./start setup --all    # change settings (writes .env)
 ./start doctor         # check keys, Node, ports, and shell variables that override .env

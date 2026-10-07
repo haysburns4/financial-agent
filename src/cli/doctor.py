@@ -63,6 +63,7 @@ def run_doctor(
     if package is not None:
         results.append(package)
     results.extend(local_checks(root, env, environ, system))
+    results.extend(checks.check_local_llm(values, environ, system))
     if network is not None:
         results.extend(checks.check_network(values, network))
     return results

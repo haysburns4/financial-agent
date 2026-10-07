@@ -32,6 +32,10 @@ WEB_SERVICE = "financial-agent-web"
 WEB_HOST = "127.0.0.1"
 API_START_TIMEOUT = 30.0
 WEB_START_TIMEOUT = 120.0
+# mlx_lm.server: loading a downloaded model takes 30-60s for a large one.
+LOCAL_LLM_LOAD_TIMEOUT = 300.0
+LOCAL_LLM_DOWNLOAD_TIMEOUT = 1800.0
+PROGRESS_INTERVAL = 15.0
 # Files whose change means `next build` output is out of date, besides web/app/.
 BUILD_INPUTS = ("package-lock.json", "package.json", "next.config.ts", "tsconfig.json")
 
@@ -42,6 +46,8 @@ class Options:
     open_browser: bool = True
     # A Yahoo period ("1mo", "5y") of daily bars to refresh at startup; None skips.
     backfill: str | None = None
+    # Also run mlx_lm.server for LLM_PROVIDER=local; off by default.
+    local_llm: bool = False
 
 
 class PortClaim(StrEnum):
@@ -138,6 +144,28 @@ def build_stale(web: Path) -> bool:
     return any(p.exists() and p.stat().st_mtime > built for p in inputs)
 
 
+def local_llm_command(target: checks.LocalServerTarget) -> tuple[str, ...]:
+    host = "::1" if target.host == "::1" else "127.0.0.1"
+    return ("uv", "run", "mlx_lm.server", "--model", target.model, "--host", host, "--port", str(target.port))
+
+
+def answers(url: str) -> bool:
+    try:
+        return httpx.get(url, timeout=2.0).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def warm_up(target: checks.LocalServerTarget) -> None:
+    """A one-token completion. mlx_lm.server answers HTTP before its model is
+    loaded (it loads in a background thread), so this is what waits for it."""
+    httpx.post(
+        f"{target.base_url.rstrip('/')}/chat/completions",
+        json={"model": target.model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+        timeout=None,
+    ).raise_for_status()
+
+
 def service_at(url: str) -> str | None:
     """The `service` a health endpoint names, or None if nothing of ours answers."""
     try:
@@ -195,6 +223,9 @@ class Launcher:
         if web_claim is PortClaim.BLOCKED:
             return 1
 
+        # Before the API, so the API's startup check finds the server up.
+        if options.local_llm and not self._start_local_llm(values):
+            return 1
         if api_claim is PortClaim.FREE and not self._start_api(api_url):
             return 1
         self._login(api_url)
@@ -303,7 +334,75 @@ class Launcher:
         self.io.info(f"Could not stop {listener}.")
         return False
 
-    # ---------- 4. API ----------
+    # ---------- 4. local LLM (--with-local-llm) ----------
+
+    def _start_local_llm(self, values: Mapping[str, str]) -> bool:
+        """Run mlx_lm.server for LOCAL_LLM_MODEL and wait until it can answer.
+
+        A port already in use is taken to be a server someone started already.
+        """
+        target = checks.local_server_target(values)
+        if target is None:
+            self.io.info("LOCAL_LLM_BASE_URL is not an http(s) URL; fix it with `./start setup`.")
+            return False
+        if "local" not in providers_in_use(values):
+            self.io.info("Note: no LLM task uses the local provider (set LLM_PROVIDER=local); starting the MLX server anyway.")
+        if not target.on_this_machine:
+            self.io.info(f"LOCAL_LLM_BASE_URL points at {target.host}, not this machine; not starting an MLX server.")
+            return True
+        if self.system.port_in_use(target.port):
+            holder = self.system.port_listener(target.port) or "a process"
+            self.io.info(
+                f"Port {target.port} is already in use by {holder}; assuming an MLX server is "
+                "running there and not starting another."
+            )
+            return True
+        if not self.system.module_available("mlx_lm"):
+            self.io.info("mlx-lm is not installed; run `uv sync` (it needs Apple Silicon).")
+            return False
+
+        downloaded = checks.model_downloaded(target.model, checks.hf_cache_dir(self.environ))
+        self.io.info(f"Starting the MLX server on port {target.port}…")
+        if downloaded:
+            self.io.info(f"Loading {target.model}; this can take a minute.")
+        else:
+            self.io.info(f"Downloading {target.model} (several GB, first run only), then loading it; this can take a while.")
+        timeout = LOCAL_LLM_LOAD_TIMEOUT if downloaded else LOCAL_LLM_DOWNLOAD_TIMEOUT
+        start = time.monotonic()
+        child = self.supervisor.start(
+            ProcessSpec(
+                "mlx", local_llm_command(target), self.root, color="33",
+                env={**self.environ, "PYTHONUNBUFFERED": "1"},
+            ),
+            echo=False,
+        )
+        models_url = f"{target.base_url.rstrip('/')}/models"
+        if not self._wait_until_up(child, lambda: answers(models_url), timeout):
+            return False
+
+        done = threading.Event()
+        failure: list[str] = []
+
+        def run() -> None:
+            try:
+                warm_up(target)
+            except httpx.HTTPError as exc:
+                failure.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                done.set()
+
+        threading.Thread(target=run, name="mlx-warm-up", daemon=True).start()
+        remaining = timeout - (time.monotonic() - start)
+        if not self._wait_until_up(child, done.is_set, remaining, progress="Still loading the model"):
+            return False
+        if failure:
+            self.io.info(f"The MLX server is up but could not answer with {target.model} ({failure[0]}). Last lines:")
+            self.supervisor.print_tail(child)
+            return False
+        self.io.info(f"MLX server ready with {target.model} ({time.monotonic() - start:.0f}s).")
+        return True
+
+    # ---------- 4b. API ----------
 
     def _start_api(self, api_url: str) -> bool:
         self.io.info("Starting the API…")
@@ -317,13 +416,22 @@ class Launcher:
             ),
             echo=False,  # quiet until the login prompts are done
         )
-        return self._wait_until_up(child, f"{api_url}/health", API_SERVICE, API_START_TIMEOUT)
+        return self._wait_until_up(child, lambda: service_at(f"{api_url}/health") == API_SERVICE, API_START_TIMEOUT)
 
-    def _wait_until_up(self, child: Child, url: str, service: str, timeout: float) -> bool:
-        deadline = time.monotonic() + timeout
+    def _wait_until_up(
+        self, child: Child, ready: Callable[[], bool], timeout: float, progress: str | None = None
+    ) -> bool:
+        """Poll `ready` until it holds, the child exits, or `timeout` passes.
+        `progress`, if given, is repeated every PROGRESS_INTERVAL so a long
+        wait does not look like a hang."""
+        start = time.monotonic()
+        deadline, next_note = start + timeout, start + PROGRESS_INTERVAL
         while time.monotonic() < deadline:
-            if service_at(url) == service:
+            if ready():
                 return True
+            if progress and time.monotonic() >= next_note:
+                self.io.info(f"{progress} ({time.monotonic() - start:.0f}s)…")
+                next_note += PROGRESS_INTERVAL
             if not child.running:
                 self.io.info(f"{child.spec.name} exited with code {child.process.returncode} while starting:")
                 self.supervisor.print_tail(child)
@@ -400,4 +508,6 @@ class Launcher:
         child = self.supervisor.start(
             ProcessSpec("web", ("npm", "run", script), self.web, color="35"), echo=False
         )
-        return self._wait_until_up(child, f"{web_url}/api/health", WEB_SERVICE, WEB_START_TIMEOUT)
+        return self._wait_until_up(
+            child, lambda: service_at(f"{web_url}/api/health") == WEB_SERVICE, WEB_START_TIMEOUT
+        )

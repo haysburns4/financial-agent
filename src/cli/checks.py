@@ -344,6 +344,99 @@ def check_provider_package(providers: set[str], system: System) -> CheckResult |
     return fail(name, f"provider {' and '.join(needing)} needs the openai package", "run `uv sync --extra dev --extra openai`")
 
 
+# ---------- local LLM (mlx_lm.server) ----------
+
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+@dataclass(frozen=True)
+class LocalServerTarget:
+    """Where LOCAL_LLM_BASE_URL says the MLX server is, and the model it should serve."""
+
+    base_url: str
+    host: str
+    port: int
+    model: str
+
+    @property
+    def on_this_machine(self) -> bool:
+        return self.host in LOCAL_HOSTS
+
+
+def local_server_target(values: Mapping[str, str]) -> LocalServerTarget | None:
+    """None if LOCAL_LLM_BASE_URL is not a usable http(s) URL."""
+    base_url = values.get("LOCAL_LLM_BASE_URL") or BY_NAME["LOCAL_LLM_BASE_URL"].default or ""
+    model = values.get("LOCAL_LLM_MODEL") or BY_NAME["LOCAL_LLM_MODEL"].default or ""
+    parts = urlsplit(base_url)
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return None
+    return LocalServerTarget(base_url, parts.hostname, port, model)
+
+
+def hf_cache_dir(environ: Mapping[str, str]) -> Path:
+    """Where huggingface_hub keeps downloaded models, by its own precedence."""
+    if environ.get("HF_HUB_CACHE"):
+        return Path(environ["HF_HUB_CACHE"]).expanduser()
+    if environ.get("HF_HOME"):
+        return Path(environ["HF_HOME"]).expanduser() / "hub"
+    if environ.get("XDG_CACHE_HOME"):
+        return Path(environ["XDG_CACHE_HOME"]).expanduser() / "huggingface" / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def model_downloaded(model: str, cache_dir: Path) -> bool:
+    """Whether `model` (a repo id, or a local directory) has weights on disk.
+
+    Looks for a snapshot holding safetensors, so an interrupted download
+    (no weights yet) does not count.
+    """
+    if Path(model).expanduser().is_dir():
+        return True
+    snapshots = cache_dir / f"models--{model.replace('/', '--')}" / "snapshots"
+    return snapshots.is_dir() and any(snapshots.glob("*/*.safetensors"))
+
+
+def check_local_llm(values: Mapping[str, str], environ: Mapping[str, str], system: System) -> list[CheckResult]:
+    """The local provider: mlx-lm installed, the model downloaded, the server's port answering."""
+    if "local" not in providers_in_use(values):
+        return []
+    results = []
+    if system.module_available("mlx_lm"):
+        results.append(ok("mlx-lm", "installed"))
+    else:
+        results.append(
+            warn("mlx-lm", "not installed; `./start --with-local-llm` needs it", "run `uv sync` (Apple Silicon only)")
+        )
+
+    target = local_server_target(values)
+    if target is None:
+        results.append(fail("LOCAL_LLM_BASE_URL", "is not an http(s) URL with a host", SETUP_HINT))
+        return results
+
+    cache = hf_cache_dir(environ)
+    if model_downloaded(target.model, cache):
+        results.append(ok("local model", "downloaded"))
+    else:
+        results.append(
+            warn("local model", f"{target.model} is not in {cache}; the first run downloads it (several GB)")
+        )
+
+    if not target.on_this_machine:
+        results.append(ok("local server port", f"{target.host} is another machine; checked over the network"))
+    elif system.port_in_use(target.port):
+        holder = system.port_listener(target.port) or "a process"
+        results.append(ok("local server port", f"{target.port} is listening ({holder})"))
+    else:
+        results.append(
+            warn("local server port", f"nothing is listening on {target.port}", "start it with `./start --with-local-llm`")
+        )
+    return results
+
+
 def check_network(values: Mapping[str, str], network: NetworkChecks) -> list[CheckResult]:
     """Only checks credentials that are present; missing ones are check_settings' job."""
     results = []

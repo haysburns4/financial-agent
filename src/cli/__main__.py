@@ -3,6 +3,7 @@
     ./start                  # set up if needed, then run the API and web UI
     ./start --dev            # same, with `next dev` instead of a production build
     ./start --backfill [5y]  # also refresh price history and recalibrate signal confidence
+    ./start --with-local-llm # also run mlx_lm.server for LLM_PROVIDER=local
     ./start login            # E-Trade login against a running API (daily); or use the
                              # "Log in to E-Trade" button in the dashboard
     ./start setup [--all]    # ask for whatever .env is missing (or everything)
@@ -55,6 +56,10 @@ def _parser() -> argparse.ArgumentParser:
         help="refresh price history from Yahoo at startup (PERIOD of daily bars, default 1mo; "
         "e.g. 5y the first time, plus the last 60 days of 5-minute bars), then recalibrate "
         "signal confidence from a walk-forward backtest",
+    )
+    start.add_argument(
+        "--with-local-llm", action="store_true",
+        help="also run mlx_lm.server with LOCAL_LLM_MODEL (for LLM_PROVIDER=local), and stop it with the rest",
     )
     login_cmd = commands.add_parser(
         "login",
@@ -125,7 +130,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     Supervisor(), webbrowser.open, interactive,
                 )
                 return launcher.run(
-                    Options(dev=args.dev, open_browser=not args.no_browser, backfill=args.backfill)
+                    Options(
+                        dev=args.dev, open_browser=not args.no_browser, backfill=args.backfill,
+                        local_llm=args.with_local_llm,
+                    )
                 )
             case _:
                 wizard = Wizard(ROOT, prompter, LiveSystem(), network, os.environ, ask_all=args.all)
