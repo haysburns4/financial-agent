@@ -9,3 +9,4 @@ logs/
 .mypy_cache/
 .ruff_cache/
 data/*.json
+data/*.db-journal

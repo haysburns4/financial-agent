@@ -23,7 +23,7 @@ from src.cli.doctor import effective_values, env_values
 from src.cli.env_file import EnvFile
 from src.cli.login import login
 from src.cli.supervisor import Child, ProcessSpec, Supervisor
-from src.cli.spec import BY_NAME
+from src.cli.spec import BY_NAME, OPENAI_SDK_PROVIDERS, providers_in_use
 from src.cli.ui import Prompter
 from src.cli.wizard import Wizard
 
@@ -249,10 +249,9 @@ class Launcher:
     # ---------- 2. dependencies ----------
 
     def _install(self, values: Mapping[str, str]) -> bool:
-        provider = (values.get("LLM_PROVIDER") or "").strip().lower()
         # --inexact keeps what else is installed (pytest, say) instead of pruning it.
         command = ["uv", "sync", "--inexact", "--quiet"]
-        if provider == "openai":
+        if providers_in_use(values) & set(OPENAI_SDK_PROVIDERS):
             command += ["--extra", "openai"]
         if self.system.run(command, self.root) != 0:
             self.io.info(f"`{' '.join(command)}` failed.")

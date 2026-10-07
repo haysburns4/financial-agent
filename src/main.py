@@ -8,6 +8,7 @@ from src.backtest import persistence as backtest_persistence
 from src.config import settings
 from src.db import engine, init_db
 from src.etrade.auth import auth
+from src.llm import health as llm_health
 from src.scheduler import build_scheduler
 from src.server import create_app
 
@@ -22,7 +23,8 @@ async def lifespan(app):
     _configure_logging()
     await init_db()
 
-    if await auth.load_persisted():
+    etrade_ready = await auth.load_persisted()
+    if etrade_ready:
         logger.info("E-Trade tokens loaded from disk; auth restored")
     else:
         logger.info("No persisted E-Trade tokens; OAuth flow required")
@@ -40,6 +42,14 @@ async def lifespan(app):
     scheduler.start()
     logger.info("Scheduler started with {} jobs", len(scheduler.get_jobs()))
     app.state.scheduler = scheduler
+
+    # A local LLM that is down is reported here, not when a chat request hangs.
+    llm_summary = await llm_health.log_startup(llm_health.MONITOR)
+    logger.info(
+        "Ready: E-Trade {}; {}",
+        "tokens loaded" if etrade_ready else "needs OAuth",
+        llm_summary,
+    )
 
     try:
         yield

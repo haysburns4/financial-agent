@@ -12,7 +12,7 @@ Automated market data collection, technical signal generation, and portfolio mon
 - **Data source:** E-Trade API via `pyetrade` (OAuth 1.0a)
 - **Scheduler:** APScheduler 3.x
 - **Indicators:** pandas-ta
-- **LLM:** provider-neutral layer (`src/llm/`); Anthropic or OpenAI
+- **LLM:** provider-neutral layer (`src/llm/`); Anthropic, OpenAI, or a local MLX server (`LLM_PROVIDER=local`)
 - **Web UI:** Next.js 16 + CopilotKit v2 (`web/`), talking to the API over AG-UI
 
 ## Getting started

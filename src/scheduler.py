@@ -16,7 +16,7 @@ from src.db import engine
 from src.etrade.accounts import ETradeAccountClient
 from src.etrade.auth import auth
 from src.etrade.market import ETradeMarketClient
-from src.llm import build_backend
+from src.llm import backend_for
 from src.pipelines import monitored_tickers
 from src.pipelines.portfolio_pipeline import PortfolioPipeline
 from src.pipelines.price_pipeline import PricePipeline
@@ -47,8 +47,9 @@ account_client = ETradeAccountClient(auth)
 price_pipeline = PricePipeline(market_client, engine)
 portfolio_pipeline = PortfolioPipeline(account_client, engine)
 signal_engine = SignalEngine(engine)
-signal_synthesizer = SignalSynthesizer(build_backend(settings.LLM_SYNTHESIS_MODEL))
-agent_chat = AgentChat(engine, build_backend(settings.LLM_CHAT_MODEL))
+# Each task asks for its own backend; provider routing lives in src/llm/factory.py.
+signal_synthesizer = SignalSynthesizer(backend_for("synthesizer"))
+agent_chat = AgentChat(engine, backend_for("chat"))
 
 
 async def _price_then_signals() -> None:

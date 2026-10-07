@@ -43,3 +43,8 @@ testpaths = ["tests"]
 # The app runs as `python -m src.main` from the repo root rather than as an
 # installed package, so tests need the root on sys.path too.
 pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "mlx-lm>=0.32.0",
+]

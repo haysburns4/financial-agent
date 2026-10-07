@@ -27,7 +27,7 @@ import requests
 from requests_oauthlib.oauth1_session import TokenRequestDenied
 
 from src.cli.env_file import EnvFile
-from src.cli.spec import BY_NAME, PROVIDER_KEYS, SPEC, problem
+from src.cli.spec import BY_NAME, OPENAI_SDK_PROVIDERS, PROVIDER_KEYS, SPEC, problem, providers_in_use
 from src.etrade.errors import denied
 
 NETWORK_TIMEOUT = 10.0
@@ -74,6 +74,8 @@ def mask(value: str | None) -> str:
 
 class NetworkChecks(Protocol):
     def llm_key(self, provider: str, key: str) -> CheckResult: ...
+
+    def local_server(self, base_url: str) -> CheckResult: ...
 
     def etrade_keys(self, consumer_key: str, consumer_secret: str) -> CheckResult: ...
 
@@ -151,6 +153,23 @@ def check_etrade_keys(
     return ok(name, "accepted")
 
 
+def check_local_server(base_url: str, client: httpx.Client) -> CheckResult:
+    """LLM_PROVIDER=local: is the MLX server answering, and with which models?"""
+    name = "local MLX server"
+    start = "start it: `uv run mlx_lm.server --model <model> --port 8080`"
+    try:
+        response = client.get(f"{base_url.rstrip('/')}/models")
+    except httpx.HTTPError as exc:
+        return fail(name, f"not reachable at {base_url} ({type(exc).__name__})", start)
+    if response.status_code != 200:
+        return fail(name, f"{base_url} answered HTTP {response.status_code}", "check LOCAL_LLM_BASE_URL")
+    try:
+        models = [m["id"] for m in response.json()["data"]]
+    except (ValueError, KeyError, TypeError):
+        return warn(name, f"{base_url} answered, but not with an OpenAI model list", "check LOCAL_LLM_BASE_URL")
+    return ok(name, f"serving {', '.join(models) or 'no models'}")
+
+
 class LiveNetworkChecks:
     def __init__(self, timeout: float = NETWORK_TIMEOUT) -> None:
         self._timeout = timeout
@@ -161,6 +180,10 @@ class LiveNetworkChecks:
 
     def etrade_keys(self, consumer_key: str, consumer_secret: str) -> CheckResult:
         return check_etrade_keys(consumer_key, consumer_secret, timeout=self._timeout)
+
+    def local_server(self, base_url: str) -> CheckResult:
+        with httpx.Client(timeout=self._timeout) as client:
+            return check_local_server(base_url, client)
 
 
 # ---------- machine ----------
@@ -310,13 +333,15 @@ def check_web_env(web: Path, values: Mapping[str, str]) -> CheckResult:
     return ok(name, "present")
 
 
-def check_provider_package(provider: str, system: System) -> CheckResult | None:
-    if provider != "openai":
+def check_provider_package(providers: set[str], system: System) -> CheckResult | None:
+    """The openai package, if any provider in use needs it (openai, local)."""
+    needing = sorted(providers & set(OPENAI_SDK_PROVIDERS))
+    if not needing:
         return None
     name = "openai package"
     if system.module_available("openai"):
         return ok(name, "installed")
-    return fail(name, "LLM_PROVIDER=openai needs the openai package", "run `uv sync --extra dev --extra openai`")
+    return fail(name, f"provider {' and '.join(needing)} needs the openai package", "run `uv sync --extra dev --extra openai`")
 
 
 def check_network(values: Mapping[str, str], network: NetworkChecks) -> list[CheckResult]:
@@ -325,8 +350,9 @@ def check_network(values: Mapping[str, str], network: NetworkChecks) -> list[Che
     key, secret = values.get("ETRADE_CONSUMER_KEY"), values.get("ETRADE_CONSUMER_SECRET")
     if key and secret:
         results.append(network.etrade_keys(key, secret))
-    provider = (values.get("LLM_PROVIDER") or BY_NAME["LLM_PROVIDER"].default or "").strip().lower()
-    llm_key = values.get(PROVIDER_KEYS.get(provider, ""))
-    if llm_key:
-        results.append(network.llm_key(provider, llm_key))
+    for provider in sorted(providers_in_use(values)):
+        if provider == "local":
+            results.append(network.local_server(values.get("LOCAL_LLM_BASE_URL") or BY_NAME["LOCAL_LLM_BASE_URL"].default or ""))
+        elif llm_key := values.get(PROVIDER_KEYS.get(provider, "")):
+            results.append(network.llm_key(provider, llm_key))
     return results

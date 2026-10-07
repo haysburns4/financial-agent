@@ -18,12 +18,14 @@ from src.cli.doctor import env_values, local_checks
 from src.cli.env_file import EnvFile, write_atomic
 from src.cli.spec import (
     BY_NAME,
+    OPENAI_SDK_PROVIDERS,
+    PROVIDERS,
     PROVIDER_KEYS,
     PROVIDER_MODELS,
-    PROVIDERS,
     SPEC,
     parse_bool,
     problem,
+    providers_in_use,
 )
 from src.cli.ui import Prompter
 
@@ -39,6 +41,8 @@ FLOW = (
     "LLM_PROVIDER",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "LOCAL_LLM_BASE_URL",
+    "LOCAL_LLM_MODEL",
     "LLM_CHAT_MODEL",
     "LLM_SYNTHESIS_MODEL",
     "WATCHLIST",
@@ -85,8 +89,11 @@ class Wizard:
         sandbox_changed = self._sandbox()
         self._etrade_keys(force=sandbox_changed)
         provider, provider_changed = self._provider()
-        self._provider_package(provider)
-        self._provider_key(provider)
+        # LLM_PROVIDER plus any provider a task is routed to (set in .env).
+        used = [provider, *sorted(providers_in_use(self._values()) - {provider})]
+        self._provider_package(used)
+        for name in used:
+            self._provider_key(name)
         self._models(provider, provider_changed)
         self._watchlist()
         self._invalid_others()
@@ -201,23 +208,46 @@ class Wizard:
         self._set("LLM_PROVIDER", provider)
         return provider, provider != before
 
-    def _provider_package(self, provider: str) -> None:
-        if provider != "openai" or self.system.module_available("openai"):
+    def _provider_package(self, providers: list[str]) -> None:
+        needing = [p for p in providers if p in OPENAI_SDK_PROVIDERS]
+        if not needing or self.system.module_available("openai"):
             return
         command = " ".join(OPENAI_SYNC)
         if not self.io.confirm(f"The openai package is not installed. Run `{command}` now?"):
-            self.io.info(f"LLM_PROVIDER=openai will not start until you run `{command}`.")
+            self.io.info(f"Provider {' and '.join(needing)} will not start until you run `{command}`.")
             return
         if self.system.run(OPENAI_SYNC, self.root) != 0:
             self.io.info(f"`{command}` failed; run it yourself to see why.")
 
     def _provider_key(self, provider: str) -> None:
+        if provider == "local":
+            self._local_server()
+            return
         name = PROVIDER_KEYS[provider]
         network = self.network
         check = None if network is None else (lambda v: network.llm_key(provider, v[0]))
         self._credentials([(name, f"{provider} API key")], check)
 
+    def _local_server(self) -> None:
+        """The local provider has no key: ask where the MLX server is, then
+        check it answers. A server that is down is reported, not re-asked —
+        the URL is usually right and the server just isn't started yet."""
+        name = "LOCAL_LLM_BASE_URL"
+        url = self.env.get(name) or BY_NAME[name].default or ""
+        if self._needs(name):
+            url = self._ask_text(name, "MLX server URL (OpenAI-compatible, from mlx_lm.server)", url)
+            self._set(name, url)
+        if self.network is not None:
+            self.io.results([self.network.local_server(url)])
+
     def _models(self, provider: str, provider_changed: bool) -> None:
+        if provider == "local":
+            # The server serves one model, for every task routed to it.
+            name = "LOCAL_LLM_MODEL"
+            if provider_changed or self._needs(name):
+                current = self.env.get(name) or BY_NAME[name].default or ""
+                self._set(name, self._ask_text(name, "Model the MLX server serves", current))
+            return
         names = ("LLM_CHAT_MODEL", "LLM_SYNTHESIS_MODEL")
         if not (provider_changed or any(self._needs(name) for name in names)):
             return

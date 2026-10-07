@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic_core import PydanticUndefined
 
-from src.cli.spec import BY_NAME, EXAMPLE_PATH, SPEC, Always, WhenEquals, is_required, problem, render_example
+from src.cli.spec import BY_NAME, EXAMPLE_PATH, SPEC, Always, is_required, problem, providers_in_use, render_example
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -54,11 +54,21 @@ def test_settings_without_a_default_are_always_required(settings_cls):
             assert spec.required_when == Always(), spec.name
 
 
-def test_conditional_rules_name_real_settings():
-    names = {s.name for s in SPEC}
-    for spec in SPEC:
-        if isinstance(spec.required_when, WhenEquals):
-            assert spec.required_when.key in names
+def test_providers_in_use_follow_the_task_overrides():
+    assert providers_in_use({}) == {"anthropic"}
+    assert providers_in_use({"LLM_PROVIDER": "local"}) == {"local"}
+    assert providers_in_use({"LLM_PROVIDER": "anthropic", "LLM_PROVIDER_CHAT": "local"}) == {"anthropic", "local"}
+    # Both tasks overridden: LLM_PROVIDER itself serves nothing.
+    assert providers_in_use(
+        {"LLM_PROVIDER": "openai", "LLM_PROVIDER_CHAT": "local", "LLM_PROVIDER_SYNTHESIZER": "anthropic"}
+    ) == {"local", "anthropic"}
+
+
+def test_a_key_is_required_when_any_task_uses_its_provider():
+    anthropic = BY_NAME["ANTHROPIC_API_KEY"]
+    assert is_required(anthropic, {"LLM_PROVIDER": "local", "LLM_PROVIDER_SYNTHESIZER": "anthropic"})
+    assert not is_required(anthropic, {"LLM_PROVIDER": "anthropic", "LLM_PROVIDER_CHAT": "local",
+                                       "LLM_PROVIDER_SYNTHESIZER": "local"})
 
 
 def test_provider_key_requirement_follows_llm_provider():
@@ -112,7 +122,7 @@ def test_cli_package_does_not_import_config():
         ("PRICE_POLL_MINUTES", "", "PRICE_POLL_MINUTES must be a whole number"),
         ("WATCHLIST", "AAPL,BRK.B", None),
         ("WATCHLIST", " , ", "WATCHLIST must list at least one ticker"),
-        ("LLM_PROVIDER", "gemini", "LLM_PROVIDER must be one of: anthropic, openai"),
+        ("LLM_PROVIDER", "gemini", "LLM_PROVIDER must be one of: anthropic, openai, local"),
         ("DISCORD_WEBHOOK_URL", "", None),
         ("DISCORD_WEBHOOK_URL", "http://x", "DISCORD_WEBHOOK_URL must be an https:// URL"),
         ("TOKEN_ENCRYPTION_KEY", "not-a-key", "TOKEN_ENCRYPTION_KEY is not a valid Fernet key"),

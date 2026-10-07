@@ -201,6 +201,30 @@ def test_switching_to_openai_suggests_its_models_and_installs_the_package(root):
     assert env(root).get("LLM_SYNTHESIS_MODEL") == "gpt-5-mini"
 
 
+def test_switching_to_local_asks_for_the_server_not_a_key(root):
+    (root / ".env").write_text(COMPLETE)
+    network = FakeNetwork()
+    io = ScriptedPrompter(
+        [
+            ("environment", "Sandbox"),
+            ("consumer key", ""),
+            ("consumer secret", ""),
+            ("provider", "local"),
+            ("MLX server URL", "<default>"),
+            ("Model the MLX server serves", "<default>"),
+            ("Watchlist", "<default>"),
+        ]
+    )
+
+    run(root, io, network=network, ask_all=True)
+
+    assert env(root).get("LLM_PROVIDER") == "local"
+    assert env(root).get("LOCAL_LLM_BASE_URL") == "http://localhost:8080/v1"
+    assert env(root).get("LOCAL_LLM_MODEL") == "mlx-community/Qwen2.5-7B-Instruct-4bit"
+    assert network.local_calls == ["http://localhost:8080/v1"]
+    assert network.llm_calls == []  # no key to check
+
+
 def test_switching_to_the_real_account_asks_for_new_keys(root):
     (root / ".env").write_text(COMPLETE.replace("ETRADE_SANDBOX=true\n", ""))
     io = ScriptedPrompter(
@@ -232,3 +256,15 @@ def test_offline_skips_key_checks(root):
     Wizard(root, io, FakeSystem(), None, {}).run()
     assert not io.script
     assert io.asked == []
+
+
+def test_a_task_routed_elsewhere_gets_its_key_asked_for(root):
+    # Chat on the local server, everything else on Anthropic.
+    (root / ".env").write_text(COMPLETE + "LLM_PROVIDER_CHAT=local\n")
+    network = FakeNetwork()
+    io = ScriptedPrompter([("MLX server URL", "<default>")])
+
+    run(root, io, network=network)
+
+    assert network.local_calls == ["http://localhost:8080/v1"]
+    assert network.llm_calls == [("anthropic", ANTHROPIC_KEY)]

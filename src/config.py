@@ -16,13 +16,22 @@ class Settings(BaseSettings):
     ETRADE_CONSUMER_SECRET: str
     ETRADE_SANDBOX: bool = True
 
-    # Only the selected provider's key is required; build_backend() raises
-    # LLMConfigError at startup if the one in use is missing.
-    LLM_PROVIDER: str = "anthropic"
+    # Only the keys of providers in use are required; build_backend() raises
+    # LLMConfigError at startup if one is missing.
+    LLM_PROVIDER: str = "anthropic"  # anthropic | openai | local
     LLM_CHAT_MODEL: str = "claude-opus-5"
     LLM_SYNTHESIS_MODEL: str = "claude-sonnet-5"
     ANTHROPIC_API_KEY: str | None = None
     OPENAI_API_KEY: str | None = None
+    # LLM_PROVIDER=local: an OpenAI-compatible MLX server (mlx_lm.server).
+    LOCAL_LLM_BASE_URL: str = "http://localhost:8080/v1"
+    LOCAL_LLM_MODEL: str = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+    LOCAL_LLM_TIMEOUT_SECONDS: int = 180
+
+    # Per-task provider overrides; unset means LLM_PROVIDER. Resolved in one
+    # place, src/llm/factory.py backend_for(task).
+    LLM_PROVIDER_CHAT: str | None = None
+    LLM_PROVIDER_SYNTHESIZER: str | None = None
 
     DATABASE_URL: str = "sqlite+aiosqlite:///data/agent.db"
 

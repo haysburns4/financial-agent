@@ -75,6 +75,7 @@ class FakeNetwork:
         self._llm = deque(llm)
         self.etrade_calls: list[tuple[str, str]] = []
         self.llm_calls: list[tuple[str, str]] = []
+        self.local_calls: list[str] = []
 
     def llm_key(self, provider: str, key: str) -> CheckResult:
         self.llm_calls.append((provider, key))
@@ -83,6 +84,10 @@ class FakeNetwork:
     def etrade_keys(self, consumer_key: str, consumer_secret: str) -> CheckResult:
         self.etrade_calls.append((consumer_key, consumer_secret))
         return self._etrade.popleft() if self._etrade else ok("E-Trade keys", "accepted")
+
+    def local_server(self, base_url: str) -> CheckResult:
+        self.local_calls.append(base_url)
+        return ok("local MLX server", "serving mlx-community/Qwen2.5-7B-Instruct-4bit")
 
 
 class FakeSystem:

@@ -243,3 +243,20 @@ def test_doctor_requires_the_openai_package_for_openai(tmp_path):
     dotenv = COMPLETE.replace("LLM_PROVIDER=anthropic", "LLM_PROVIDER=openai") + "OPENAI_API_KEY=sk-o\n"
     results = run_doctor(_install(tmp_path, dotenv), {}, FakeSystem(modules=()), None)
     assert any(r.name == "openai package" and r.status is Status.FAIL for r in results)
+
+
+def test_doctor_checks_the_local_server_instead_of_a_key(tmp_path):
+    dotenv = COMPLETE.replace("LLM_PROVIDER=anthropic", "LLM_PROVIDER=local")
+    network = FakeNetwork()
+    results = run_doctor(_install(tmp_path, dotenv), {}, FakeSystem(), network)
+    assert exit_code(results) == 0
+    assert network.local_calls == ["http://localhost:8080/v1"] and network.llm_calls == []
+    assert any(r.name == "openai package" for r in results)  # the local provider needs the SDK too
+
+
+def test_doctor_checks_every_provider_a_task_uses(tmp_path):
+    dotenv = COMPLETE + "LLM_PROVIDER_SYNTHESIZER=local\n"
+    network = FakeNetwork()
+    run_doctor(_install(tmp_path, dotenv), {}, FakeSystem(), network)
+    assert network.llm_calls and network.llm_calls[0][0] == "anthropic"
+    assert network.local_calls == ["http://localhost:8080/v1"]
