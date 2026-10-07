@@ -2,10 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { EtradeLogin } from "./etrade-login";
 import { dashboardSchema, proxyErrorSchema, type Dashboard, type Position } from "./portfolio";
 
 // Stored positions change at most every PORTFOLIO_POLL_MINUTES (15) on the
-// server; polling faster than that only re-reads the same rows.
+// server; polling faster than that only re-reads the same rows. It also notices
+// when E-Trade ends the session (midnight ET) and swaps in the login button.
 const POLL_MS = 60_000;
 
 type SortKey = "ticker" | "market_value" | "pnl" | "pnl_pct" | "weight";
@@ -67,12 +69,14 @@ export function PortfolioPanel() {
   });
   const [now, setNow] = useState(() => Date.now());
 
-  const load = useCallback(async (method: "GET" | "POST") => {
+  const load = useCallback(async (method: "GET" | "POST"): Promise<boolean> => {
     try {
       setData(await request(method));
       setError(null);
+      return true;
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : String(exc));
+      return false;
     } finally {
       setNow(Date.now());
     }
@@ -84,10 +88,17 @@ export function PortfolioPanel() {
     return () => clearInterval(timer);
   }, [load]);
 
-  async function refresh() {
+  async function refresh(): Promise<boolean> {
     setRefreshing(true);
-    await load("POST");
+    const ok = await load("POST");
     setRefreshing(false);
+    return ok;
+  }
+
+  async function loggedIn() {
+    // If pulling positions fails, still re-read the dashboard so the header
+    // stops offering a login that already happened.
+    if (!(await refresh())) await load("GET");
   }
 
   const selected = data?.accounts.find((a) => a.account_id === account) ?? null;
@@ -129,16 +140,13 @@ export function PortfolioPanel() {
   return (
     <section className="portfolio" aria-label="Portfolio">
       <div className="portfolio-head">
-        <div>
+        <div className="portfolio-title">
           <h2>Portfolio</h2>
-          <p className="meta">
+          <div className="meta">
             {data?.last_updated ? `Positions as of ${ago(data.last_updated, now)}` : "No positions stored yet"}
-            {data && (
-              <span className={data.authenticated ? "pill ok" : "pill warn"}>
-                {data.authenticated ? "E-Trade connected" : "E-Trade logged out"}
-              </span>
-            )}
-          </p>
+            {data?.authenticated === true && <span className="pill ok">E-Trade connected</span>}
+            {data?.authenticated === false && <EtradeLogin onLoggedIn={loggedIn} />}
+          </div>
         </div>
         <button
           type="button"
@@ -217,7 +225,9 @@ export function PortfolioPanel() {
 
           {rows.length === 0 ? (
             <p className="placeholder">
-              No positions yet. Log in to E-Trade, then press Refresh.
+              {data.authenticated
+                ? "No positions yet. Press Refresh to pull them from E-Trade."
+                : "No positions yet. Log in to E-Trade to load them."}
             </p>
           ) : (
             <div className="table-wrap">

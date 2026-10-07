@@ -249,3 +249,55 @@ html, body {
   color: #ffb4b4;
   font-size: 13px;
 }
+
+/* ---------- E-Trade login (replaces the "logged out" pill) ---------- */
+
+.portfolio-title { flex: 1; min-width: 0; }
+
+button.pill {
+  font: inherit;
+  font-size: 11px;
+  background: transparent;
+  cursor: pointer;
+}
+button.pill.login:hover,
+button.pill.login[aria-expanded="true"] { border-color: var(--warn); background: #2a2212; }
+
+.etrade-login {
+  flex-basis: 100%;
+  margin-top: 6px;
+  padding: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+.etrade-login p { margin: 0 0 10px; }
+.etrade-login a { color: var(--accent); }
+.etrade-login label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.etrade-login .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.etrade-login input {
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.08em;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  width: 12em;
+}
+.etrade-login input:focus { outline: none; border-color: var(--accent); }
+.etrade-login .login-error { color: #ffb4b4; }
+.etrade-login button.link {
+  font: inherit;
+  font-size: 13px;
+  color: var(--muted);
+  background: none;
+  border: 0;
+  padding: 6px 4px;
+  cursor: pointer;
+}
+.etrade-login button.link:hover { color: var(--text); }
+.etrade-login .login-error .hint { display: block; margin-top: 4px; color: var(--muted); }

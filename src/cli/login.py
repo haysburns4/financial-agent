@@ -2,7 +2,8 @@
 
 E-Trade ends every session at midnight ET, so this runs daily. It drives the
 API's own OAuth endpoints over HTTP rather than importing src.etrade.auth,
-which would pull in src.config.
+which would pull in src.config. The dashboard's "Log in to E-Trade" button
+(web/app/etrade-login.tsx) drives the same endpoints from the browser.
 """
 from __future__ import annotations
 

@@ -2,7 +2,8 @@
 
     ./start                  # set up if needed, then run the API and web UI
     ./start --dev            # same, with `next dev` instead of a production build
-    ./start login            # E-Trade login against a running API (daily)
+    ./start login            # E-Trade login against a running API (daily); or use the
+                             # "Log in to E-Trade" button in the dashboard
     ./start setup [--all]    # ask for whatever .env is missing (or everything)
     ./start doctor           # check the install, exit 1 on any failure
 
@@ -48,7 +49,10 @@ def _parser() -> argparse.ArgumentParser:
     start = commands.add_parser("start", parents=[common], help="run the app (default)")
     start.add_argument("--dev", action="store_true", help="run the web UI with `next dev`")
     start.add_argument("--no-browser", action="store_true", help="don't open the dashboard")
-    login_cmd = commands.add_parser("login", help="log in to E-Trade against the running API")
+    login_cmd = commands.add_parser(
+        "login",
+        help="log in to E-Trade against the running API (the dashboard's \"Log in to E-Trade\" button does the same)",
+    )
     login_cmd.set_defaults(offline=False, non_interactive=False)
     setup = commands.add_parser("setup", parents=[common], help="write .env interactively")
     setup.add_argument("--all", action="store_true", help="re-ask every setting, not just missing ones")

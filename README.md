@@ -1,4 +1,4 @@
-# financial-agent [![CI](https://github.com/haysburns4/financial-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/haysburns4/financial-agent/actions/workflows/ci.yml)
+# financial-agent <a href="https://github.com/haysburns4/financial-agent/actions/workflows/ci.yml"><img align="right" src="https://github.com/haysburns4/financial-agent/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
 
 Automated market data collection, technical signal generation, and portfolio monitoring backed by E-Trade, with a chat agent and web dashboard.
 
@@ -38,8 +38,9 @@ http://127.0.0.1:3000. Ctrl-C stops everything. Later runs skip whatever is alre
 ./start doctor         # check keys, Node, ports, and shell variables that override .env
 ```
 
-E-Trade ends every session at midnight ET, so run `./start login` once a day (or restart
-`./start`). Positions refresh every 15 minutes, or immediately via **Refresh** in the
+E-Trade ends every session at midnight ET, so log in again once a day: press **Log in to
+E-Trade** in the dashboard (it appears within a minute of the session ending), or run
+`./start login`. Positions refresh every 15 minutes, or immediately via **Refresh** in the
 dashboard. Both servers listen on 127.0.0.1 only.
 
 Settings live in `.env`; `.env.example` lists every one with its default and a one-line
