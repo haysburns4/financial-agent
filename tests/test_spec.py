@@ -90,7 +90,8 @@ def test_cli_package_does_not_import_config():
     code = (
         "import sys\n"
         "import src.cli.__main__, src.cli.checks, src.cli.doctor, src.cli.env_file\n"
-        "import src.cli.spec, src.cli.ui, src.cli.wizard\n"
+        "import src.cli.launcher, src.cli.login, src.cli.spec, src.cli.supervisor\n"
+        "import src.cli.ui, src.cli.wizard\n"
         "assert 'src.config' not in sys.modules, 'src.cli imported src.config'\n"
     )
     env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(ROOT)}

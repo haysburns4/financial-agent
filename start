@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# One command to set up and run financial-agent. See `./start --help`.
+#   ./start            set up if needed, then run the API and web UI
+#   ./start login      daily E-Trade login against the running app
+#   ./start setup      (re)write .env
+#   ./start doctor     check the install
+set -euo pipefail
+cd "$(dirname "$0")"
+
+UV_INSTALL_URL="https://astral.sh/uv/install.sh"
+
+if ! command -v uv >/dev/null 2>&1; then
+  # The installer's default location, if a previous install never reached PATH.
+  if [ -x "$HOME/.local/bin/uv" ]; then
+    export PATH="$HOME/.local/bin:$PATH"
+  elif [ -t 0 ]; then
+    echo "financial-agent runs on uv (https://docs.astral.sh/uv/), which is not installed."
+    read -r -p "Install it now with the official script ($UV_INSTALL_URL)? [Y/n] " answer
+    case "$answer" in
+      [nN]*) echo "Install uv yourself, then run ./start again."; exit 1 ;;
+    esac
+    curl -LsSf "$UV_INSTALL_URL" | sh
+    export PATH="$HOME/.local/bin:$PATH"
+  else
+    echo "uv is not installed; see https://docs.astral.sh/uv/ (or run ./start in a terminal)." >&2
+    exit 1
+  fi
+fi
+
+exec uv run python -m src.cli "$@"

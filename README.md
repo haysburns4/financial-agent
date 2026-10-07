@@ -15,62 +15,50 @@ Automated market data collection, technical signal generation, and portfolio mon
 - **LLM:** provider-neutral layer (`src/llm/`); Anthropic or OpenAI
 - **Web UI:** Next.js 16 + CopilotKit v2 (`web/`), talking to the API over AG-UI
 
-## Setup
+## Getting started
 
-1. Install uv:
-   ```
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
-2. Clone the repo and `cd` into it.
-3. Install dependencies (add `--extra openai` if using OpenAI):
-   ```
-   uv sync --extra dev
-   ```
-4. Create `.env` in the repo root. The setup wizard will write it for you; to do it by
-   hand instead, copy the template and fill in the blanks:
-   ```
-   cp .env.example .env
-   chmod 600 .env
-   ```
-   `.env.example` lists every setting with its default and a one-line description. You
-   need at least `ETRADE_CONSUMER_KEY`, `ETRADE_CONSUMER_SECRET` and the API key for your
-   `LLM_PROVIDER` (`ANTHROPIC_API_KEY` by default).
-   Generate `TOKEN_ENCRYPTION_KEY` with:
-   ```
-   uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-   ```
-   Variables exported in your shell override `.env`.
-5. Install the web UI:
-   ```
-   cd web
-   cp .env.local.example .env.local
-   npm install
-   ```
+You need Node.js 20+ and E-Trade API keys from [developer.etrade.com](https://developer.etrade.com)
+(sandbox keys work for trying it out). Then:
 
-## Running
-
-Start the API (creates the SQLite DB on first run):
 ```
-uv run python -m src.main          # http://127.0.0.1:8000
+git clone <this repo> && cd financial-agent
+./start
 ```
 
-Start the web UI in a second terminal:
+`./start` installs [uv](https://docs.astral.sh/uv/) if it is missing. It
+asks for any settings that are missing and installs dependencies. It then starts the API
+and the web UI, walks you through the E-Trade login and opens the dashboard at
+http://127.0.0.1:3000. Ctrl-C stops everything. Later runs skip whatever is already done.
+
 ```
-cd web && npm run dev              # http://127.0.0.1:3000
+./start --dev          # web UI with hot reload (`next dev`) instead of a production build
+./start --no-browser   # don't open the dashboard
+./start login          # log in to E-Trade again, against the running app
+./start setup --all    # change settings (writes .env)
+./start doctor         # check keys, Node, ports, and shell variables that override .env
 ```
 
-### E-Trade login
+E-Trade ends every session at midnight ET, so run `./start login` once a day (or restart
+`./start`). Positions refresh every 15 minutes, or immediately via **Refresh** in the
+dashboard. Both servers listen on 127.0.0.1 only.
 
-1. `curl -X POST localhost:8000/auth/start` and open the returned `auth_url`.
-2. Log in, accept, and copy the verification code (it expires in ~5 minutes).
-3. Send it:
-   ```
-   curl -X POST localhost:8000/auth/complete -H 'Content-Type: application/json' -d '{"verifier":"XXXX"}'
-   ```
-4. Check with `curl localhost:8000/auth/status`.
+Settings live in `.env`; `.env.example` lists every one with its default and a one-line
+description. Variables exported in your shell override `.env`.
 
-E-Trade ends every session at midnight ET, so repeat this daily. Positions refresh
-every 15 minutes, or immediately via **Refresh** in the dashboard.
+### Running without the launcher
+
+1. `uv sync --extra dev` (add `--extra openai` for `LLM_PROVIDER=openai`).
+2. `cp .env.example .env && chmod 600 .env`, then fill in at least the E-Trade keys and
+   your provider's API key. Generate `TOKEN_ENCRYPTION_KEY` with
+   `uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
+3. `cd web && cp .env.local.example .env.local && npm install`
+4. Run `uv run python -m src.main` (API, http://127.0.0.1:8000) and, in a second terminal,
+   `cd web && npm run dev` (http://127.0.0.1:3000).
+5. Log in to E-Trade: `curl -X POST 127.0.0.1:8000/auth/start`, open the `auth_url`,
+   accept, then send the code (it expires in about 5 minutes):
+   ```
+   curl -X POST 127.0.0.1:8000/auth/complete -H 'Content-Type: application/json' -d '{"verifier":"XXXX"}'
+   ```
 
 ### Tests and lint
 

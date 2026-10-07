@@ -166,12 +166,21 @@ class LiveNetworkChecks:
 # ---------- machine ----------
 
 
+@dataclass(frozen=True)
+class Listener:
+    pid: int
+    command: str
+
+    def __str__(self) -> str:
+        return f"{self.command} (pid {self.pid})"
+
+
 class System(Protocol):
     def node_version(self) -> str | None: ...
 
     def port_in_use(self, port: int) -> bool: ...
 
-    def port_holder(self, port: int) -> str | None: ...
+    def port_listener(self, port: int) -> Listener | None: ...
 
     def module_available(self, name: str) -> bool: ...
 
@@ -191,7 +200,7 @@ class LiveSystem:
             sock.settimeout(0.5)
             return sock.connect_ex(("127.0.0.1", port)) == 0
 
-    def port_holder(self, port: int) -> str | None:
+    def port_listener(self, port: int) -> Listener | None:
         lsof = shutil.which("lsof")
         if lsof is None:
             return None
@@ -199,10 +208,11 @@ class LiveSystem:
             [lsof, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpc"],
             capture_output=True, text=True, timeout=10,
         )
+        # -F output: one field per line, tagged by its first character.
         fields = {line[0]: line[1:] for line in result.stdout.splitlines() if line}
-        if "c" not in fields:
+        if not fields.get("p", "").isdigit():
             return None
-        return f"{fields['c']} (pid {fields.get('p', '?')})"
+        return Listener(int(fields["p"]), fields.get("c", "unknown"))
 
     def module_available(self, name: str) -> bool:
         return importlib.util.find_spec(name) is not None
@@ -223,16 +233,23 @@ def check_node(system: System) -> CheckResult:
     return ok(name, version)
 
 
-def check_node_modules(web: Path) -> CheckResult:
-    name = "web dependencies"
-    fix = "run `cd web && npm install`"
+def node_modules_stale(web: Path) -> bool:
+    """True if web/node_modules is missing or older than package-lock.json."""
     modules, lock = web / "node_modules", web / "package-lock.json"
     if not modules.is_dir():
-        return fail(name, "web/node_modules is missing", fix)
+        return True
     # npm rewrites node_modules/.package-lock.json on every install.
     marker = modules / ".package-lock.json"
     installed = (marker if marker.exists() else modules).stat().st_mtime
-    if lock.exists() and lock.stat().st_mtime > installed:
+    return lock.exists() and lock.stat().st_mtime > installed
+
+
+def check_node_modules(web: Path) -> CheckResult:
+    name = "web dependencies"
+    fix = "run `cd web && npm install`"
+    if not (web / "node_modules").is_dir():
+        return fail(name, "web/node_modules is missing", fix)
+    if node_modules_stale(web):
         return warn(name, "package-lock.json changed since the last install", fix)
     return ok(name, "installed")
 
@@ -241,7 +258,7 @@ def check_port(port: int, system: System) -> CheckResult:
     name = f"port {port}"
     if not system.port_in_use(port):
         return ok(name, "free")
-    holder = system.port_holder(port) or "another process"
+    holder = system.port_listener(port) or "another process"
     return warn(name, f"in use by {holder}", "stop it, or it may be the app already running")
 
 

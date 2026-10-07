@@ -3,7 +3,7 @@ from collections import deque
 from collections.abc import Sequence
 from pathlib import Path
 
-from src.cli.checks import CheckResult, Status, ok
+from src.cli.checks import CheckResult, Listener, Status, ok
 
 # A .env the wizard and doctor have nothing to say about.
 ETRADE_KEY = "etrade-key-0000000000001234"
@@ -105,8 +105,8 @@ class FakeSystem:
     def port_in_use(self, port: int) -> bool:
         return port in self.busy_ports
 
-    def port_holder(self, port: int) -> str | None:
-        return "python3 (pid 4242)" if port in self.busy_ports else None
+    def port_listener(self, port: int) -> Listener | None:
+        return Listener(4242, "python3") if port in self.busy_ports else None
 
     def module_available(self, name: str) -> bool:
         return name in self.modules

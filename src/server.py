@@ -62,7 +62,8 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         ok = await health_check()
-        return {"status": "ok" if ok else "degraded", "db": ok}
+        # `service` lets the launcher recognise an instance it can reuse.
+        return {"status": "ok" if ok else "degraded", "db": ok, "service": "financial-agent"}
 
     @app.post("/auth/start")
     async def auth_start():
