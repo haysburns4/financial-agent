@@ -16,6 +16,7 @@ from src.backtest.runner import BacktestRunner
 from src.config import settings
 from src.db import engine, get_connection, health_check
 from src.etrade.auth import ETradeAuthError, auth
+from src.llm import health as llm_health
 from src.models import Indicator, PipelineRun, Position, PriceBar, Signal
 from src.pipelines import monitored_tickers
 from src.portfolio import dashboard, position_dict, risk_by_account, risk_summary
@@ -78,10 +79,14 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         ok = await health_check()
+        llm, alerts = await llm_health.llm_health(llm_health.MONITOR)
         # `service` lets the launcher recognise an instance it can reuse.
+        # A down local LLM degrades the service: market data still collects.
         return {
-            "status": "ok" if ok else "degraded",
+            "status": "ok" if ok and not alerts else "degraded",
             "db": ok,
+            "llm": llm,
+            "alerts": alerts,
             "service": "financial-agent",
             # Daily-trend confirmation of 5-minute signals; in memory, so it
             # counts from the API's last restart within the 24h window.

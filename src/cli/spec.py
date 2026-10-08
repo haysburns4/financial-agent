@@ -32,14 +32,14 @@ class Never:
 
 
 @dataclass(frozen=True)
-class WhenEquals:
-    """Required when another setting has this value (case-insensitive)."""
+class WhenProviderUsed:
+    """Required when any LLM task runs on this provider: LLM_PROVIDER, or a
+    per-task override (LLM_PROVIDER_CHAT / LLM_PROVIDER_SYNTHESIZER)."""
 
-    key: str
-    value: str
+    provider: str
 
 
-RequiredWhen = Always | Never | WhenEquals
+RequiredWhen = Always | Never | WhenProviderUsed
 
 
 @dataclass(frozen=True)
@@ -97,12 +97,18 @@ class SettingSpec:
     required_when: RequiredWhen = Never()
 
 
-PROVIDERS = ("anthropic", "openai")
+PROVIDERS = ("anthropic", "openai", "local")
 # (chat model, synthesis model) offered when a provider is picked.
 PROVIDER_MODELS: Mapping[str, tuple[str, str]] = {
     "anthropic": ("claude-opus-5", "claude-sonnet-5"),
     "openai": ("gpt-5", "gpt-5-mini"),
 }
+# The tasks' provider overrides; unset means LLM_PROVIDER. Mirrors
+# resolve_task() in src/llm/factory.py, which src/cli cannot import.
+TASK_PROVIDER_SETTINGS = ("LLM_PROVIDER_CHAT", "LLM_PROVIDER_SYNTHESIZER")
+# Providers that need the openai package: OpenAI itself, and the local MLX
+# server, which speaks its API.
+OPENAI_SDK_PROVIDERS = ("openai", "local")
 PROVIDER_KEYS: Mapping[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
@@ -127,7 +133,7 @@ SPEC: tuple[SettingSpec, ...] = (
         Boolean(),
     ),
     SettingSpec(
-        "LLM_PROVIDER", "anthropic", False, "LLM provider: anthropic | openai.", Choice(PROVIDERS)
+        "LLM_PROVIDER", "anthropic", False, "LLM provider: anthropic | openai | local (an MLX server).", Choice(PROVIDERS)
     ),
     SettingSpec("LLM_CHAT_MODEL", "claude-opus-5", False, "Model for the chat agent.", Text()),
     SettingSpec(
@@ -136,12 +142,32 @@ SPEC: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         "ANTHROPIC_API_KEY", None, True,
-        "Anthropic API key.", Credential(), WhenEquals("LLM_PROVIDER", "anthropic"),
+        "Anthropic API key.", Credential(), WhenProviderUsed("anthropic"),
     ),
     SettingSpec(
         "OPENAI_API_KEY", None, True,
-        "OpenAI API key (also: uv sync --extra openai).", Credential(),
-        WhenEquals("LLM_PROVIDER", "openai"),
+        "OpenAI API key (also: uv sync --extra openai).", Credential(), WhenProviderUsed("openai"),
+    ),
+    SettingSpec(
+        "LOCAL_LLM_BASE_URL", "http://localhost:8080/v1", False,
+        "Provider local: the MLX server's OpenAI-compatible endpoint (mlx_lm.server).", Text(),
+    ),
+    SettingSpec(
+        "LOCAL_LLM_MODEL", "mlx-community/Qwen3-14B-4bit", False,
+        "Provider local: the model the MLX server serves, used by every task routed to it.", Text(),
+    ),
+    SettingSpec(
+        "LOCAL_LLM_TIMEOUT_SECONDS", "180", False,
+        "Provider local: request timeout; a large model's first token can take tens of seconds.",
+        Integer(1, 3600),
+    ),
+    SettingSpec(
+        "LLM_PROVIDER_CHAT", None, False,
+        "Provider for the chat agent; blank uses LLM_PROVIDER.", Choice(PROVIDERS),
+    ),
+    SettingSpec(
+        "LLM_PROVIDER_SYNTHESIZER", None, False,
+        "Provider for the signal synthesizer; blank uses LLM_PROVIDER.", Choice(PROVIDERS),
     ),
     SettingSpec(
         "DATABASE_URL", "sqlite+aiosqlite:///data/agent.db", False,
@@ -187,9 +213,14 @@ def is_required(spec: SettingSpec, values: Mapping[str, str]) -> bool:
             return True
         case Never():
             return False
-        case WhenEquals(key=key, value=value):
-            other = values.get(key) or BY_NAME[key].default or ""
-            return other.strip().lower() == value.lower()
+        case WhenProviderUsed(provider=provider):
+            return provider in providers_in_use(values)
+
+
+def providers_in_use(values: Mapping[str, str]) -> set[str]:
+    """Every provider some LLM task runs on: each task's override, else LLM_PROVIDER."""
+    base = (values.get("LLM_PROVIDER") or BY_NAME["LLM_PROVIDER"].default or "").strip().lower()
+    return {(values.get(name) or base).strip().lower() for name in TASK_PROVIDER_SETTINGS}
 
 
 def problem(spec: SettingSpec, values: Mapping[str, str]) -> str | None:
@@ -256,8 +287,8 @@ def _requirement(rule: RequiredWhen) -> str | None:
             return "Required."
         case Never():
             return None
-        case WhenEquals(key=key, value=value):
-            return f"Required when {key}={value}."
+        case WhenProviderUsed(provider=provider):
+            return f"Required when LLM_PROVIDER (or a task's override) is {provider}."
 
 
 def render_example() -> str:

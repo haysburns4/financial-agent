@@ -12,7 +12,7 @@ Automated market data collection, technical signal generation, and portfolio mon
 - **Data source:** E-Trade API via `pyetrade` (OAuth 1.0a)
 - **Scheduler:** APScheduler 3.x
 - **Indicators:** pandas-ta
-- **LLM:** provider-neutral layer (`src/llm/`); Anthropic or OpenAI
+- **LLM:** provider-neutral layer (`src/llm/`); Anthropic, OpenAI, or a local MLX server (`LLM_PROVIDER=local`)
 - **Web UI:** Next.js 16 + CopilotKit v2 (`web/`), talking to the API over AG-UI
 
 ## Getting started
@@ -33,6 +33,7 @@ http://127.0.0.1:3000. Ctrl-C stops everything. Later runs skip whatever is alre
 ./start --dev          # web UI with hot reload (`next dev`) instead of a production build
 ./start --no-browser   # don't open the dashboard
 ./start --backfill     # refresh prices, recalibrate, catch up on missed signals (`--backfill 5y` the first time)
+./start --with-local-llm  # also run mlx_lm.server for LLM_PROVIDER=local
 ./start login          # log in to E-Trade again, against the running app
 ./start setup --all    # change settings (writes .env)
 ./start doctor         # check keys, Node, ports, and shell variables that override .env

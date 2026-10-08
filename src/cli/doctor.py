@@ -7,7 +7,7 @@ from pathlib import Path
 from src.cli import checks
 from src.cli.checks import CheckResult, NetworkChecks, Status, System
 from src.cli.env_file import EnvFile
-from src.cli.spec import BY_NAME, SPEC
+from src.cli.spec import BY_NAME, SPEC, providers_in_use
 
 
 def env_values(env: EnvFile) -> dict[str, str]:
@@ -59,11 +59,11 @@ def run_doctor(
                 checks.SETUP_HINT,
             )
         )
-    provider = (values.get("LLM_PROVIDER") or "").strip().lower()
-    package = checks.check_provider_package(provider, system)
+    package = checks.check_provider_package(providers_in_use(values), system)
     if package is not None:
         results.append(package)
     results.extend(local_checks(root, env, environ, system))
+    results.extend(checks.check_local_llm(values, environ, system))
     if network is not None:
         results.extend(checks.check_network(values, network))
     return results
