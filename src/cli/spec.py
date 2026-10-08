@@ -153,7 +153,7 @@ SPEC: tuple[SettingSpec, ...] = (
         "Provider local: the MLX server's OpenAI-compatible endpoint (mlx_lm.server).", Text(),
     ),
     SettingSpec(
-        "LOCAL_LLM_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit", False,
+        "LOCAL_LLM_MODEL", "mlx-community/Qwen3-14B-4bit", False,
         "Provider local: the model the MLX server serves, used by every task routed to it.", Text(),
     ),
     SettingSpec(

@@ -14,7 +14,7 @@ from src.llm import LLMConnectionError, Message, MessageComplete, TextDelta, Too
 from src.llm.local_backend import PLACEHOLDER_API_KEY, LocalBackend, make_client
 
 BASE = "http://mlx.test/v1"
-MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+MODEL = "mlx-community/Qwen3-14B-4bit"
 
 
 def _sse(*chunks: dict) -> bytes:

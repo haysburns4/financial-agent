@@ -9,7 +9,7 @@ from src.llm import health
 from src.llm.health import LocalServerMonitor, llm_health, log_startup
 
 BASE = "http://mlx.test/v1"
-MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+MODEL = "mlx-community/Qwen3-14B-4bit"
 
 
 def _local(**overrides):

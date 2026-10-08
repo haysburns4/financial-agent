@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str | None = None
     # LLM_PROVIDER=local: an OpenAI-compatible MLX server (mlx_lm.server).
     LOCAL_LLM_BASE_URL: str = "http://localhost:8080/v1"
-    LOCAL_LLM_MODEL: str = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+    LOCAL_LLM_MODEL: str = "mlx-community/Qwen3-14B-4bit"
     LOCAL_LLM_TIMEOUT_SECONDS: int = 180
 
     # Per-task provider overrides; unset means LLM_PROVIDER. Resolved in one

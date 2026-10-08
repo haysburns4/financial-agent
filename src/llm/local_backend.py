@@ -12,7 +12,7 @@ the server does:
 - the usual failure is the server not running, so connection errors name the
   base URL and say so, instead of surfacing the SDK's generic message.
 
-Model names are Hugging Face repo paths ("mlx-community/Qwen2.5-7B-Instruct-4bit")
+Model names are Hugging Face repo paths ("mlx-community/Qwen3-14B-4bit")
 and pass through verbatim. Missing usage is reported as zero tokens.
 
 Needs the `openai` package, like the OpenAI backend — `uv sync --extra openai`.

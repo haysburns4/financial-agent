@@ -87,7 +87,7 @@ class FakeNetwork:
 
     def local_server(self, base_url: str) -> CheckResult:
         self.local_calls.append(base_url)
-        return ok("local MLX server", "serving mlx-community/Qwen2.5-7B-Instruct-4bit")
+        return ok("local MLX server", "serving mlx-community/Qwen3-14B-4bit")
 
 
 class FakeSystem:

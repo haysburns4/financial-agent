@@ -71,7 +71,7 @@ def test_start_is_the_default_command(argv, expected):
 
 # ---------- --with-local-llm ----------
 
-MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+MODEL = "mlx-community/Qwen3-14B-4bit"
 FAKE_SERVER = Path(__file__).parent / "fixtures" / "fake_mlx_server.py"
 
 

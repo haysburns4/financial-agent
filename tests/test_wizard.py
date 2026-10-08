@@ -220,7 +220,7 @@ def test_switching_to_local_asks_for_the_server_not_a_key(root):
 
     assert env(root).get("LLM_PROVIDER") == "local"
     assert env(root).get("LOCAL_LLM_BASE_URL") == "http://localhost:8080/v1"
-    assert env(root).get("LOCAL_LLM_MODEL") == "mlx-community/Qwen2.5-7B-Instruct-4bit"
+    assert env(root).get("LOCAL_LLM_MODEL") == "mlx-community/Qwen3-14B-4bit"
     assert network.local_calls == ["http://localhost:8080/v1"]
     assert network.llm_calls == []  # no key to check
 

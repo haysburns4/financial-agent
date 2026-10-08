@@ -268,7 +268,7 @@ def test_doctor_checks_every_provider_a_task_uses(tmp_path):
 
 # ---------- local LLM (mlx_lm.server) ----------
 
-LOCAL_MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+LOCAL_MODEL = "mlx-community/Qwen3-14B-4bit"
 
 
 def _cache_model(cache: Path, model: str = LOCAL_MODEL, weights: bool = True) -> None:
