@@ -1,11 +1,12 @@
 """The agent callers, exercised end-to-end against FakeBackend."""
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import insert
 
 from src.agent.chat import AgentChat
 from src.agent.synthesizer import SignalSynthesizer
-from src.llm import Message, MessageComplete, TextDelta, Usage
+from src.llm import Message, MessageComplete, TextDelta, ToolResult, Usage
 from src.models import Position
 
 from tests.conftest import FakeBackend, text_reply, tool_reply
@@ -181,3 +182,53 @@ async def test_synthesize_short_circuits_on_no_signals():
     backend = FakeBackend(text_reply("unused"))
     assert await SignalSynthesizer(backend).synthesize([], {}) == "No new signals."
     assert backend.calls == []  # no provider call, no spend
+
+
+# ---------- the highlighted account ----------
+
+
+async def _seed_two_accounts(engine):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(Position),
+            [{"account_id": acct, "ticker": ticker, "quantity": 1.0, "cost_basis": 100.0,
+              "market_value": 100.0, "last_updated": datetime.now(timezone.utc)}
+             for acct, ticker in [("84719991", "AAPL"), ("55520002", "MSFT"), ("55520002", "NVDA")]],
+        )
+
+
+async def test_the_prompt_names_the_highlighted_account_masked(engine, backend):
+    await _seed_two_accounts(engine)
+    result = await AgentChat(engine, backend).ask("What do I hold?", account_id="84719991")
+
+    system = backend.calls[0]["system"]
+    assert "highlighted account ••9991" in system
+    assert "1 positions in the highlighted account ••9991 (2 account(s) stored)" in system
+    assert "84719991" not in system
+    assert result["context_used"]["highlighted_account"] == "84719991"
+
+
+async def test_tools_run_against_the_highlighted_account(engine):
+    await _seed_two_accounts(engine)
+    backend = FakeBackend([tool_reply("get_positions", {}), text_reply("Two positions.")])
+
+    items = [i async for i in AgentChat(engine, backend).ask_stream("What do I hold?", account_id="55520002")]
+
+    result = next(i for i in items if isinstance(i, ToolResult))
+    assert {p["ticker"] for p in json.loads(result.content)} == {"MSFT", "NVDA"}
+
+
+async def test_an_unknown_highlight_falls_back_to_every_account(engine, backend):
+    await _seed_two_accounts(engine)
+    result = await AgentChat(engine, backend).ask("What do I hold?", account_id="00000000")
+
+    system = backend.calls[0]["system"]
+    assert "highlighted account" not in system
+    assert "3 positions across 2 account(s)" in system
+    assert result["context_used"]["highlighted_account"] is None
+
+
+async def test_no_highlight_analyzes_every_account(engine, backend):
+    await _seed_two_accounts(engine)
+    await AgentChat(engine, backend).ask("What do I hold?")
+    assert "highlighted" not in backend.calls[0]["system"]

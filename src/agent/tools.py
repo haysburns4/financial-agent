@@ -5,6 +5,11 @@ model asks for what it needs, so context stays bounded as the watchlist grows.
 
 Arguments come from the model and are untrusted — every handler normalises
 tickers and clamps limits rather than passing values straight into a query.
+
+Account data (positions, risk, position alerts) covers the account highlighted
+on the dashboard by default; a call reaches other accounts only by naming one,
+or "all", in its `account_id` argument. Market data (entry/exit signals, price
+history) is not per account and is never narrowed.
 """
 import json
 from collections import Counter
@@ -29,23 +34,32 @@ _DEFAULT_SIGNAL_DAYS = 2
 # fixed confidence, so ranking them against calibrated signals would put them
 # all on top. They are listed on their own instead.
 _ALERT_RULES = frozenset(r for r in CONFIRMATION_RULES if required_trend(r) is None)
+# The `account_id` value that widens a call to every account.
+ALL_ACCOUNTS = "all"
+
+
+def _account_arg(subject: str) -> dict:
+    return {
+        "type": "string",
+        "description": (
+            f"Whose {subject}: omit for the highlighted account (every account if "
+            f"none is highlighted). Only when the user asks about another account "
+            f"or all of them, pass its number (the last four digits are enough) or "
+            f"\"{ALL_ACCOUNTS}\"."
+        ),
+    }
+
 
 TOOLS: tuple[ToolDef, ...] = (
     ToolDef(
         name="get_positions",
         description=(
-            "Current portfolio positions across all accounts, with quantity, cost "
-            "basis, market value and P&L. Use for holdings, position sizes and "
-            "per-ticker exposure."
+            "Current portfolio positions, with quantity, cost basis, market value "
+            "and P&L. Use for holdings, position sizes and per-ticker exposure."
         ),
         parameters={
             "type": "object",
-            "properties": {
-                "account_id": {
-                    "type": "string",
-                    "description": "Restrict to one account. Omit for every account.",
-                }
-            },
+            "properties": {"account_id": _account_arg("positions")},
         },
     ),
     ToolDef(
@@ -54,7 +68,10 @@ TOOLS: tuple[ToolDef, ...] = (
             "Total exposure, per-ticker concentration and drawdown, combined and "
             "broken down by account. Use for concentration or risk questions."
         ),
-        parameters={"type": "object", "properties": {}},
+        parameters={
+            "type": "object",
+            "properties": {"account_id": _account_arg("risk")},
+        },
     ),
     ToolDef(
         name="get_signals",
@@ -64,8 +81,8 @@ TOOLS: tuple[ToolDef, ...] = (
             "highest-confidence entry/exit signals with their rule, direction, "
             "calibrated confidence and reasoning; a count per rule for the rest; "
             "and the current position alerts (stop-loss, concentration, "
-            "drawdown), listed separately because their confidence is a fixed "
-            "default, not a calibrated one."
+            "drawdown) for tickers held in the account, listed separately "
+            "because their confidence is a fixed default, not a calibrated one."
         ),
         parameters={
             "type": "object",
@@ -80,6 +97,7 @@ TOOLS: tuple[ToolDef, ...] = (
                     "type": "integer",
                     "description": f"Look-back in trading days (default {_DEFAULT_SIGNAL_DAYS}, max 30).",
                 },
+                "account_id": _account_arg("position alerts"),
             },
         },
     ),
@@ -104,8 +122,8 @@ TOOLS: tuple[ToolDef, ...] = (
 )
 
 
-async def run_tool(engine: AsyncEngine, call: ToolCall) -> ToolResult:
-    """Execute one tool call, returning its result as JSON.
+async def run_tool(engine: AsyncEngine, call: ToolCall, highlighted: str | None = None) -> ToolResult:
+    """Execute one tool call on the highlighred account, returning its result as JSON.
 
     Never raises: a failure is reported back to the model as an error result so
     it can recover or explain, rather than killing the run.
@@ -117,7 +135,7 @@ async def run_tool(engine: AsyncEngine, call: ToolCall) -> ToolResult:
 
     try:
         async with engine.begin() as conn:
-            payload = await handler(conn, call.arguments)
+            payload = await handler(conn, call.arguments, highlighted)
     except Exception as exc:
         logger.exception("tool: {} failed", call.name)
         return ToolResult(call.id, f"{type(exc).__name__}: {exc}", is_error=True)
@@ -127,9 +145,16 @@ async def run_tool(engine: AsyncEngine, call: ToolCall) -> ToolResult:
     return ToolResult(call.id, content)
 
 
-async def data_summary(conn: AsyncConnection) -> dict:
+async def known_accounts(conn: AsyncConnection) -> list[str]:
+    return sorted((await conn.scalars(select(distinct(Position.account_id)))).all())
+
+
+async def data_summary(conn: AsyncConnection, highlighted: str | None = None) -> dict:
     """Counts and freshness for the system prompt, so the model knows what exists."""
-    positions = await conn.scalar(select(func.count(Position.id))) or 0
+    count = select(func.count(Position.id))
+    if highlighted is not None:
+        count = count.where(Position.account_id == highlighted)
+    positions = await conn.scalar(count) or 0
     accounts = await conn.scalar(select(func.count(distinct(Position.account_id)))) or 0
     cutoff = minus_trading_days(datetime.now(timezone.utc), _DEFAULT_SIGNAL_DAYS)
     signals = await conn.scalar(
@@ -147,16 +172,42 @@ async def data_summary(conn: AsyncConnection) -> dict:
 # ---------- handlers ----------
 
 
-async def _get_positions(conn: AsyncConnection, args: dict) -> list[dict]:
+async def _account_scope(conn: AsyncConnection, args: dict, highlighted: str | None) -> str | None:
+    """The account a call covers, or None for every account.
+
+    No `account_id` argument means the highlighted account. Otherwise it is
+    "all", an account number, or a unique last-digits suffix ("9991", "••9991"),
+    the form the model is told to show accounts in.
+    """
+    requested = _text(args.get("account_id"))
+    if requested is None:
+        return highlighted
+    if requested.lower() == ALL_ACCOUNTS:
+        return None
+    known = await known_accounts(conn)
+    if requested in known:
+        return requested
+    digits = requested.lstrip("•*.… ")
+    matches = [a for a in known if digits and a.endswith(digits)]
+    if len(matches) == 1:
+        return matches[0]
+    choices = ", ".join(mask_account(a) for a in known) or "none stored"
+    problem = "matches more than one account" if matches else "is not a known account"
+    raise ValueError(f"account_id {requested!r} {problem} (accounts: {choices})")
+
+
+async def _get_positions(conn: AsyncConnection, args: dict, highlighted: str | None) -> list[dict]:
     stmt = select(Position).order_by(Position.market_value.desc())
-    if account_id := _text(args.get("account_id")):
+    if account_id := await _account_scope(conn, args, highlighted):
         stmt = stmt.where(Position.account_id == account_id)
     return [position_dict(r) for r in (await conn.execute(stmt)).all()]
 
 
-async def _get_portfolio_risk(conn: AsyncConnection, args: dict) -> dict:
-    rows = (await conn.execute(select(Position))).all()
-    return risk_by_account(rows)
+async def _get_portfolio_risk(conn: AsyncConnection, args: dict, highlighted: str | None) -> dict:
+    stmt = select(Position)
+    if account_id := await _account_scope(conn, args, highlighted):
+        stmt = stmt.where(Position.account_id == account_id)
+    return risk_by_account((await conn.execute(stmt)).all())
 
 
 def _signal_dict(r: Row) -> dict:
@@ -172,9 +223,12 @@ def _signal_dict(r: Row) -> dict:
     }
 
 
-async def _get_signals(conn: AsyncConnection, args: dict) -> dict:
+async def _get_signals(conn: AsyncConnection, args: dict, highlighted: str | None) -> dict:
     """An overview that stays short however many signals fired: the top few by
-    confidence, a count per rule, and position alerts on their own."""
+    confidence, a count per rule, and position alerts on their own.
+
+    Alerts are about positions, so they are narrowed to the tickers the account
+    holds; entry/exit signals are about the market and are not."""
     days = _clamp(args.get("days"), default=_DEFAULT_SIGNAL_DAYS, low=1, high=30)
     cutoff = minus_trading_days(datetime.now(timezone.utc), days)
     stmt = select(Signal).where(Signal.timestamp >= cutoff)
@@ -183,6 +237,11 @@ async def _get_signals(conn: AsyncConnection, args: dict) -> dict:
     if category := _text(args.get("category")):
         stmt = stmt.where(Signal.signal_type.in_(signal_types_for_category(category)))
     rows = (await conn.execute(stmt)).all()
+    held: set[str] | None = None
+    if account_id := await _account_scope(conn, args, highlighted):
+        held = set(
+            (await conn.scalars(select(Position.ticker).where(Position.account_id == account_id))).all()
+        )
 
     ranked = sorted(
         (r for r in rows if r.signal_type not in _ALERT_RULES),
@@ -192,7 +251,8 @@ async def _get_signals(conn: AsyncConnection, args: dict) -> dict:
     # Alerts repeat while a position stays down: keep the newest per ticker.
     alerts: dict[tuple[str, str], Row] = {}
     for r in sorted((r for r in rows if r.signal_type in _ALERT_RULES), key=lambda r: r.timestamp):
-        alerts[(r.ticker, r.signal_type)] = r
+        if held is None or r.ticker in held:
+            alerts[(r.ticker, r.signal_type)] = r
     return {
         "since": cutoff,
         "trading_days": days,
@@ -203,7 +263,7 @@ async def _get_signals(conn: AsyncConnection, args: dict) -> dict:
     }
 
 
-async def _get_price_history(conn: AsyncConnection, args: dict) -> dict:
+async def _get_price_history(conn: AsyncConnection, args: dict, highlighted: str | None) -> dict:
     ticker = _ticker(args.get("ticker"))
     if not ticker:
         raise ValueError("ticker is required")
@@ -245,6 +305,12 @@ assert {t.name for t in TOOLS} == set(_HANDLERS), "TOOLS and _HANDLERS disagree"
 
 
 # ---------- argument coercion ----------
+
+
+def mask_account(account_id: str) -> str:
+    """The last four digits, as the dashboard shows an account (••9991)."""
+    return f"••{account_id[-4:]}"
+
 
 
 def _text(value: Any) -> str | None:  # anti-slop: allow no-any-parameters - this IS the parse boundary for model-supplied JSON

@@ -1,5 +1,6 @@
 "use client";
 
+import { useAgentContext } from "@copilotkit/react-core/v2";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { EtradeLogin } from "./etrade-login";
@@ -9,6 +10,10 @@ import { dashboardSchema, proxyErrorSchema, type Dashboard, type Position } from
 // server; polling faster than that only re-reads the same rows. It also notices
 // when E-Trade ends the session (midnight ET) and swaps in the login button.
 const POLL_MS = 60_000;
+
+// Sent with every chat run; must match HIGHLIGHTED_ACCOUNT_CONTEXT in src/agui.py.
+// The agent analyzes this account by default, "all" meaning every account.
+const HIGHLIGHTED_ACCOUNT_CONTEXT = "highlighted_account";
 
 type SortKey = "ticker" | "market_value" | "pnl" | "pnl_pct" | "weight";
 type Row = Position & { price: number | null; weight: number };
@@ -103,6 +108,9 @@ export function PortfolioPanel() {
 
   const selected = data?.accounts.find((a) => a.account_id === account) ?? null;
   const view = selected ?? data?.totals ?? null;
+  // The tab on screen, not the raw state: an account gone after a refresh shows
+  // (and is analyzed) as "All accounts".
+  useAgentContext({ description: HIGHLIGHTED_ACCOUNT_CONTEXT, value: selected?.account_id ?? "all" });
 
   const rows = useMemo<Row[]>(() => {
     if (!data) return [];

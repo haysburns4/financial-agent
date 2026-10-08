@@ -162,7 +162,7 @@ async def test_unknown_tool_is_reported_not_raised(engine):
 
 
 async def test_tool_failure_is_reported_as_an_error_result(engine, monkeypatch):
-    async def _boom(conn, args):
+    async def _boom(conn, args, highlighted):
         raise RuntimeError("table is on fire")
 
     monkeypatch.setitem(tools._HANDLERS, "get_positions", _boom)
@@ -198,3 +198,93 @@ async def test_data_summary_counts_accounts_not_positions(engine):
 
 def test_every_tool_has_a_handler():
     assert {t.name for t in TOOLS} == set(tools._HANDLERS)
+
+
+# ---------- the highlighted account ----------
+
+
+async def _call_highlighted(engine, name: str, arguments: dict | None = None, highlighted: str | None = "A1"):
+    result = await run_tool(engine, ToolCall(id="c1", name=name, arguments=arguments or {}), highlighted)
+    return result, json.loads(result.content) if not result.is_error else None
+
+
+async def test_account_tools_cover_the_highlighted_account_by_default(engine):
+    await _seed(engine)
+
+    _, positions = await _call_highlighted(engine, "get_positions")
+    _, risk = await _call_highlighted(engine, "get_portfolio_risk")
+
+    assert [p["account_id"] for p in positions] == ["A1"]
+    assert risk["combined"]["position_count"] == 1
+    assert set(risk["by_account"]) == {"A1"}
+
+
+async def test_all_widens_an_account_tool_to_every_account(engine):
+    await _seed(engine)
+
+    _, positions = await _call_highlighted(engine, "get_positions", {"account_id": "ALL"})
+    _, risk = await _call_highlighted(engine, "get_portfolio_risk", {"account_id": "all"})
+
+    assert {p["account_id"] for p in positions} == {"A1", "A2"}
+    assert set(risk["by_account"]) == {"A1", "A2"}
+
+
+async def test_naming_another_account_overrides_the_highlight(engine):
+    await _seed(engine)
+    _, positions = await _call_highlighted(engine, "get_positions", {"account_id": "A2"})
+    assert [p["ticker"] for p in positions] == ["MSFT"]
+
+
+async def _seed_numbered(engine):
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as conn:
+        await conn.execute(insert(Position), [
+            {"account_id": acct, "ticker": ticker, "quantity": 1.0, "cost_basis": 100.0,
+             "market_value": 100.0, "last_updated": now}
+            for acct, ticker in [("84719991", "AAPL"), ("55520001", "MSFT"), ("66620001", "NVDA")]
+        ])
+
+
+@pytest.mark.parametrize("named", ["9991", "••9991", "84719991"])
+async def test_an_account_can_be_named_by_its_last_digits(engine, named):
+    await _seed_numbered(engine)
+    _, positions = await _call_highlighted(engine, "get_positions", {"account_id": named}, highlighted=None)
+    assert [p["account_id"] for p in positions] == ["84719991"]
+
+
+@pytest.mark.parametrize(
+    ("named", "problem"),
+    [("1234", "is not a known account"), ("0001", "matches more than one account")],
+)
+async def test_an_unresolvable_account_is_an_error_listing_masked_accounts(engine, named, problem):
+    await _seed_numbered(engine)
+    result, _ = await _call_highlighted(engine, "get_positions", {"account_id": named}, highlighted=None)
+
+    assert result.is_error and problem in result.content
+    assert "••9991" in result.content and "84719991" not in result.content
+
+
+async def test_position_alerts_are_narrowed_to_the_highlighted_account_but_market_signals_are_not(engine):
+    await _seed(engine)  # A1 holds AAPL, A2 holds MSFT; AAPL golden_cross, MSFT death_cross
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as conn:
+        await conn.execute(insert(Signal), [
+            _signal("AAPL", "stop_loss_warning", 0.75, now),
+            _signal("MSFT", "stop_loss_warning", 0.75, now),
+        ])
+
+    _, highlighted = await _call_highlighted(engine, "get_signals")
+    _, everything = await _call_highlighted(engine, "get_signals", {"account_id": "all"})
+
+    assert [s["ticker"] for s in highlighted["alerts"]] == ["AAPL"]
+    assert {s["ticker"] for s in highlighted["top"]} == {"AAPL", "MSFT"}
+    assert [s["ticker"] for s in everything["alerts"]] == ["AAPL", "MSFT"]
+
+
+async def test_data_summary_counts_the_highlighted_accounts_positions(engine):
+    await _seed(engine)
+    async with engine.begin() as conn:
+        summary = await data_summary(conn, "A2")
+
+    assert summary["positions"] == 1
+    assert summary["accounts"] == 2

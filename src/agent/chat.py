@@ -9,13 +9,16 @@ The agent reaches its data through the tools in [src/agent/tools.py] rather than
 receiving a dump of it in the system prompt, so context stays bounded however
 large the watchlist and position set grow. The prompt carries only enough
 orientation for the model to know what is worth asking for.
+
+The account highlighted on the dashboard (forwarded by the caller) is the one
+analyzed by default per the prompt.
 """
 from collections.abc import AsyncIterator
 
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from src.agent.tools import TOOLS, data_summary, run_tool
+from src.agent.tools import TOOLS, data_summary, known_accounts, mask_account, run_tool
 from src.config import settings
 from src.etrade.auth import auth as etrade_auth
 from src.llm import (
@@ -39,6 +42,13 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "offer what you can answer instead. Be concise, and reference specific tickers, "
     "positions and signals by name. Refer to an account by the last four digits "
     "of its number (e.g. ••9991), as the dashboard does; never write it in full."
+)
+
+_HIGHLIGHT_NOTE = (
+    "\n\nThe user has highlighted account {account} on the dashboard. Analyze "
+    "only that account; the account tools cover it unless you pass another "
+    "account_id. Look at another account, or all of them, only when the user "
+    "explicitly asks, and say which account each figure comes from when you do."
 )
 
 _STALE_AUTH_NOTE = (
@@ -74,13 +84,15 @@ class AgentChat:
         self,
         question: str,
         conversation_history: list[dict] | None = None,
+        account_id: str | None = None,
     ) -> dict:
-        system_prompt, summary = await self._prepare()
+        """`account_id` is the highlighted account; None analyzes every account."""
+        system_prompt, summary, highlighted = await self._prepare(account_id)
         messages = self._build_messages(question, conversation_history)
 
         answer: list[str] = []
         tools_called: list[dict] = []
-        async for item in self._run(system_prompt, messages):
+        async for item in self._run(system_prompt, messages, highlighted):
             if isinstance(item, TextDelta):
                 answer.append(item.text)
             elif isinstance(item, MessageComplete):
@@ -101,6 +113,7 @@ class AgentChat:
         return {
             "answer": text,
             "context_used": {
+                "highlighted_account": highlighted,
                 "tools_called": tools_called,
                 "data_freshness_minutes": summary["data_freshness_minutes"],
             },
@@ -110,31 +123,40 @@ class AgentChat:
         self,
         question: str,
         conversation_history: list[dict] | None = None,
+        account_id: str | None = None,
     ) -> AsyncIterator[Delta | ToolResult]:
         """`ask` in streaming form, for the AG-UI/CopilotKit endpoint.
 
         Yields provider deltas plus a `ToolResult` for each tool the agent runs.
         """
-        system_prompt, _ = await self._prepare()
+        system_prompt, _, highlighted = await self._prepare(account_id)
         async for item in self._run(
-            system_prompt, self._build_messages(question, conversation_history)
+            system_prompt, self._build_messages(question, conversation_history), highlighted
         ):
             yield item
 
-    async def _prepare(self) -> tuple[str, dict]:
+    async def _prepare(self, account_id: str | None) -> tuple[str, dict, str | None]:
         """Build the system prompt from a cheap summary of what data exists."""
         async with self._engine.begin() as conn:
-            summary = await data_summary(conn)
+            highlighted = account_id
+            if highlighted is not None and highlighted not in await known_accounts(conn):
+                logger.warning("chat: highlighted account {} is not stored; using every account",
+                               mask_account(highlighted))
+                highlighted = None
+            summary = await data_summary(conn, highlighted)
 
-        prompt = _SYSTEM_PROMPT_TEMPLATE.format(facts=_format_facts(summary))
+        prompt = _SYSTEM_PROMPT_TEMPLATE.format(facts=_format_facts(summary, highlighted))
+        if highlighted is not None:
+            prompt += _HIGHLIGHT_NOTE.format(account=mask_account(highlighted))
         if not await etrade_auth.is_authenticated():
             prompt += _STALE_AUTH_NOTE
-        return prompt, summary
+        return prompt, summary, highlighted
 
     async def _run(
         self,
         system_prompt: str,
         messages: list[Message],
+        highlighted: str | None,
     ) -> AsyncIterator[Delta | ToolResult]:
         """Drive model -> tools -> model until the model stops asking for tools."""
         for _ in range(self.MAX_TOOL_ITERATIONS):
@@ -165,7 +187,7 @@ class AgentChat:
             messages.append(final.message)
             results = []
             for call in final.message.tool_calls:
-                result = await run_tool(self._engine, call)
+                result = await run_tool(self._engine, call, highlighted)
                 results.append(result)
                 yield result
             messages.append(Message(role="user", tool_results=tuple(results)))
@@ -191,11 +213,17 @@ class AgentChat:
         return messages
 
 
-def _format_facts(summary: dict) -> str:
+def _format_facts(summary: dict, highlighted: str | None) -> str:
     freshness = summary["data_freshness_minutes"]
+    holdings = (
+        f"- {summary['positions']} positions in the highlighted account "
+        f"{mask_account(highlighted)} ({summary['accounts']} account(s) stored)"
+        if highlighted is not None
+        else f"- {summary['positions']} positions across {summary['accounts']} account(s)"
+    )
     lines = [
         f"- Watchlist: {', '.join(settings.WATCHLIST)}",
-        f"- {summary['positions']} positions across {summary['accounts']} account(s)",
+        holdings,
         f"- {summary['signals_recent']} signal(s) in the last 2 trading days",
     ]
     lines.append(

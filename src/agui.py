@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Sequence
 
 from ag_ui.core import (
     AssistantMessage,
+    Context,
     RunAgentInput,
     RunErrorEvent,
     RunFinishedEvent,
@@ -28,7 +29,12 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 
 from src.agent.chat import AgentChat
+from src.agent.tools import ALL_ACCOUNTS
 from src.llm import MessageComplete, TextDelta, ToolCallDelta, ToolResult
+
+# The context entry the dashboard sends with every run (useAgentContext in
+# web/app/portfolio-panel.tsx): the selected account tab, or "all".
+HIGHLIGHTED_ACCOUNT_CONTEXT = "highlighted_account"
 
 
 def create_agui_router(chat: AgentChat) -> APIRouter:
@@ -43,6 +49,15 @@ def create_agui_router(chat: AgentChat) -> APIRouter:
         )
 
     return router
+
+
+def highlighted_account(context: Sequence[Context]) -> str | None:
+    """The account the dashboard has selected, or None for every account."""
+    for entry in context:
+        if entry.description == HIGHLIGHTED_ACCOUNT_CONTEXT:
+            value = entry.value.strip()
+            return None if not value or value.lower() == ALL_ACCOUNTS else value
+    return None
 
 
 def split_conversation(messages: Sequence) -> tuple[str, list[dict]]:
@@ -92,7 +107,9 @@ async def _run(
     try:
         question, history = split_conversation(body.messages)
 
-        async for delta in chat.ask_stream(question, history):
+        account_id = highlighted_account(body.context or ())
+
+        async for delta in chat.ask_stream(question, history, account_id):
             if isinstance(delta, TextDelta):
                 if not text_open:
                     yield encoder.encode(

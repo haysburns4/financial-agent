@@ -70,6 +70,8 @@ class ChatTurn(BaseModel):
 class ChatRequest(BaseModel):
     question: str
     conversation_history: list[ChatTurn] | None = None
+    # The highlighted account, analyzed by default; omit for every account.
+    account_id: str | None = None
 
 
 def create_app() -> FastAPI:
@@ -479,7 +481,7 @@ def create_app() -> FastAPI:
             else None
         )
         try:
-            return await agent_chat.ask(body.question, history)
+            return await agent_chat.ask(body.question, history, body.account_id)
         except Exception as exc:
             from loguru import logger
             logger.exception("/chat failed")

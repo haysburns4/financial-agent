@@ -1,14 +1,17 @@
 """The AG-UI adapter: transcript in, protocol event stream out."""
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
-from ag_ui.core import AssistantMessage, SystemMessage, UserMessage
+from ag_ui.core import AssistantMessage, Context, SystemMessage, UserMessage
 from fastapi import FastAPI
+from sqlalchemy import insert
 
 from src.agent.chat import AgentChat
-from src.agui import create_agui_router, split_conversation
+from src.agui import create_agui_router, highlighted_account, split_conversation
 from src.llm import LLMStatusError
+from src.models import Position
 
 from tests.conftest import FakeBackend, text_reply, tool_reply
 
@@ -102,7 +105,7 @@ async def test_backend_failure_is_a_run_error(engine):
 
 async def test_a_tool_run_streams_call_then_result_then_answer(engine):
     backend = FakeBackend(
-        [tool_reply("get_positions", {"account_id": "A1"}), text_reply("You hold nothing.")]
+        [tool_reply("get_positions", {"account_id": "all"}), text_reply("You hold nothing.")]
     )
     events = await _post(engine, backend, [_user("what do I hold")])
 
@@ -118,7 +121,7 @@ async def test_a_tool_run_streams_call_then_result_then_answer(engine):
         "RUN_FINISHED",
     ]
     assert events[1]["toolCallName"] == "get_positions"
-    assert events[2]["delta"] == '{"account_id": "A1"}'
+    assert events[2]["delta"] == '{"account_id": "all"}'
     # Start, args, end and result all address the same call.
     assert {e["toolCallId"] for e in events[1:5]} == {"c1"}
     assert events[4]["content"] == "[]"  # empty DB, but the tool really ran
@@ -173,3 +176,39 @@ def test_split_conversation_drops_system_and_keeps_order():
 def test_split_conversation_rejects_a_transcript_with_no_user_turn():
     with pytest.raises(ValueError, match="no user message"):
         split_conversation([AssistantMessage(id="a1", content="hi")])
+
+
+# ---------- the highlighted account ----------
+
+
+@pytest.mark.parametrize(
+    ("context", "expected"),
+    [
+        ([{"description": "highlighted_account", "value": "84719991"}], "84719991"),
+        ([{"description": "highlighted_account", "value": "all"}], None),
+        ([{"description": "highlighted_account", "value": " "}], None),
+        ([{"description": "something else", "value": "84719991"}], None),
+        ([], None),
+    ],
+)
+def test_highlighted_account_is_read_from_the_run_context(context, expected):
+    assert highlighted_account([Context(**c) for c in context]) == expected
+
+
+async def test_the_dashboards_highlight_scopes_the_agents_tools(engine):
+    async with engine.begin() as conn:
+        await conn.execute(insert(Position), [
+            {"account_id": acct, "ticker": ticker, "quantity": 1.0, "cost_basis": 100.0,
+             "market_value": 100.0, "last_updated": datetime.now(timezone.utc)}
+            for acct, ticker in [("84719991", "AAPL"), ("55520002", "MSFT")]
+        ])
+    backend = FakeBackend([tool_reply("get_positions", {}), text_reply("You hold MSFT.")])
+
+    events = await _post(
+        engine, backend, [_user("what do I hold")],
+        context=[{"description": "highlighted_account", "value": "55520002"}],
+    )
+
+    result = next(e for e in events if e["type"] == "TOOL_CALL_RESULT")
+    assert [p["ticker"] for p in json.loads(result["content"])] == ["MSFT"]
+    assert "••0002" in backend.calls[0]["system"]
