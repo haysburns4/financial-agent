@@ -9,6 +9,9 @@ the server does:
 - no authentication: the client sends a placeholder key;
 - first-token latency of tens of seconds: a long timeout
   (LOCAL_LLM_TIMEOUT_SECONDS) and no retries, so a dead server fails fast;
+- thinking models (Qwen3, the default) reason before answering, which costs
+  seconds and output tokens; that is switched off through the chat template
+  (`enable_thinking`), which templates without the flag ignore;
 - the usual failure is the server not running, so connection errors name the
   base URL and say so, instead of surfacing the SDK's generic message.
 
@@ -23,10 +26,13 @@ from typing import Any
 import openai
 
 from src.llm.base import Delta, LLMConnectionError, Message, ToolDef
+from src.llm.health import start_hint
 from src.llm.openai_backend import OpenAIBackend
 
 # mlx_lm.server ignores credentials, but the SDK requires a non-empty key.
 PLACEHOLDER_API_KEY = "not-needed"
+# Passed to the model's chat template by mlx_lm.server.
+CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 
 
 def make_client(base_url: str, timeout_seconds: float) -> openai.AsyncOpenAI:
@@ -37,6 +43,12 @@ def make_client(base_url: str, timeout_seconds: float) -> openai.AsyncOpenAI:
         # Retrying a local server that isn't running only delays the error.
         max_retries=0,
     )
+
+
+def _with_template_kwargs(extra_body: dict[str, Any]) -> dict[str, Any]:  # anti-slop: allow no-any-returns - JSON request body
+    """`extra_body` with CHAT_TEMPLATE_KWARGS added; the caller's own kwargs win."""
+    kwargs = {**CHAT_TEMPLATE_KWARGS, **extra_body.get("chat_template_kwargs", {})}
+    return {**extra_body, "chat_template_kwargs": kwargs}
 
 
 class LocalBackend(OpenAIBackend):
@@ -60,7 +72,8 @@ class LocalBackend(OpenAIBackend):
     ) -> AsyncIterator[Delta]:
         try:
             async for delta in super().stream(
-                system=system, messages=messages, tools=tools, max_tokens=max_tokens, **extra,
+                system=system, messages=messages, tools=tools, max_tokens=max_tokens,
+                extra_body=_with_template_kwargs(extra.pop("extra_body", None) or {}), **extra,
             ):
                 yield delta
         except LLMConnectionError as exc:
@@ -73,8 +86,8 @@ class LocalBackend(OpenAIBackend):
                 f"{self._timeout_seconds:.0f}s. A large model can be slow to start; "
                 "raise LOCAL_LLM_TIMEOUT_SECONDS if it is still loading."
             )
+        hint = start_hint(self._base_url, self.model)
         return (
             f"Can't reach the local MLX server at {self._base_url}: it appears to be down. "
-            f"Start it with `uv run mlx_lm.server --model {self.model} --port 8080`, "
-            "or point LOCAL_LLM_BASE_URL at where it runs."
+            f"{hint[0].upper()}{hint[1:]}."
         )

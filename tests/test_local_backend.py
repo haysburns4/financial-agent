@@ -67,6 +67,21 @@ async def test_streams_text_and_usage_like_openai():
     assert backend.provider == "local"
 
 
+async def test_thinking_is_switched_off_through_the_chat_template():
+    backend, seen = _backend(_stream(_sse(_text("ok", "stop"))))
+    await collect(backend.stream(system="s", messages=[Message(role="user", text="hi")]))
+    assert json.loads(seen[0].content)["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+async def test_a_caller_can_turn_thinking_back_on_and_add_template_kwargs():
+    backend, seen = _backend(_stream(_sse(_text("ok", "stop"))))
+    extra_body = {"chat_template_kwargs": {"enable_thinking": True, "x": 1}, "top_k": 20}
+    await collect(backend.stream(system="s", messages=[Message(role="user", text="hi")], extra_body=extra_body))
+    body = json.loads(seen[0].content)
+    assert body["chat_template_kwargs"] == {"enable_thinking": True, "x": 1}
+    assert body["top_k"] == 20
+
+
 async def test_missing_usage_counts_as_zero():
     backend, _ = _backend(_stream(_sse(_text("ok", "stop"))))  # no usage chunk at all
     response = await collect(backend.stream(system="s", messages=[Message(role="user", text="hi")]))
@@ -110,7 +125,8 @@ async def test_a_server_that_is_down_is_named_not_a_raw_connection_error():
 
     message = str(exc.value)
     assert BASE in message and "appears to be down" in message
-    assert "mlx_lm.server" in message
+    assert f"uv run mlx_lm.server --model {MODEL} --port 80" in message  # the port BASE names
+    assert "./start --with-local-llm" in message and "LOCAL_LLM_BASE_URL" in message
 
 
 async def test_a_slow_server_points_at_the_timeout_setting():
@@ -158,7 +174,7 @@ def test_doctor_reports_a_server_that_is_down():
 
     result = check_local_server(BASE, _sync_client(refuse))
     assert result.status is Status.FAIL
-    assert BASE in result.message and "mlx_lm.server" in (result.fix or "")
+    assert BASE in result.message and "./start --with-local-llm" in (result.fix or "")
 
 
 # ---------- per-task routing ----------

@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, get_args
+from urllib.parse import urlsplit
 
 import httpx
 from loguru import logger
@@ -86,9 +87,16 @@ def task_providers(config: Settings = settings) -> dict[str, str]:
     return {task: resolve_task(task, config)[0] for task in get_args(Task)}
 
 
-def start_hint(config: Settings = settings) -> str:
+def start_hint(base_url: str, model: str) -> str:
+    """How to start the MLX server that `base_url` names, on the port it names."""
+    parts = urlsplit(base_url)
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        port = None
+    command = f"uv run mlx_lm.server --model {model}" + (f" --port {port}" if port else "")
     return (
-        f"start it with `uv run mlx_lm.server --model {config.LOCAL_LLM_MODEL} --port 8080`, "
+        f"start it with `./start --with-local-llm` or `{command}`, "
         "or point LOCAL_LLM_BASE_URL at where it runs"
     )
 
@@ -137,7 +145,7 @@ async def log_startup(monitor: LocalServerMonitor, config: Settings = settings) 
     if not probe.reachable:
         logger.warning(
             "Local MLX server at {} is not reachable ({}); LLM features are down until it is. {}",
-            config.LOCAL_LLM_BASE_URL, probe.error, start_hint(config),
+            config.LOCAL_LLM_BASE_URL, probe.error, start_hint(config.LOCAL_LLM_BASE_URL, config.LOCAL_LLM_MODEL),
         )
         return f"LLM {routing}; local server unreachable at {config.LOCAL_LLM_BASE_URL}"
 

@@ -6,7 +6,7 @@ from loguru import logger
 
 from src.config import settings
 from src.llm import health
-from src.llm.health import LocalServerMonitor, llm_health, log_startup
+from src.llm.health import LocalServerMonitor, llm_health, log_startup, start_hint
 
 BASE = "http://mlx.test/v1"
 MODEL = "mlx-community/Qwen3-14B-4bit"
@@ -140,6 +140,21 @@ async def test_startup_warns_with_the_url_and_how_to_start_the_server(logs):
     warning = next(line for line in logs if line.startswith("WARNING"))
     assert BASE in warning and "mlx_lm.server" in warning
     assert "unreachable" in summary
+
+
+@pytest.mark.parametrize(
+    ("url", "port_flag"),
+    [
+        ("http://localhost:9001/v1", " --port 9001"),
+        ("http://localhost/v1", " --port 80"),
+        ("https://gpu-box/v1", " --port 443"),
+        ("http://localhost:99999/v1", ""),  # an invalid port is left to mlx_lm.server's default
+    ],
+)
+def test_start_hint_uses_the_port_in_the_base_url(url, port_flag):
+    hint = start_hint(url, MODEL)
+    assert f"`uv run mlx_lm.server --model {MODEL}{port_flag}`" in hint
+    assert "./start --with-local-llm" in hint
 
 
 async def test_startup_warns_when_the_configured_model_is_not_served(logs):

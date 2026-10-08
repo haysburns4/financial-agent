@@ -156,7 +156,7 @@ def check_etrade_keys(
 def check_local_server(base_url: str, client: httpx.Client) -> CheckResult:
     """LLM_PROVIDER=local: is the MLX server answering, and with which models?"""
     name = "local MLX server"
-    start = "start it: `uv run mlx_lm.server --model <model> --port 8080`"
+    start = "start it with `./start --with-local-llm`"
     try:
         response = client.get(f"{base_url.rstrip('/')}/models")
     except httpx.HTTPError as exc:
