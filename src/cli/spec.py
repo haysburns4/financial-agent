@@ -185,6 +185,10 @@ SPEC: tuple[SettingSpec, ...] = (
         "Minutes between portfolio refreshes.", Integer(1, 1440),
     ),
     SettingSpec(
+        "SNAPSHOT_ON_STARTUP", "true", False,
+        "Capture a portfolio history snapshot each time the API starts.", Boolean(),
+    ),
+    SettingSpec(
         "DISCORD_WEBHOOK_URL", None, True,
         "Discord webhook for alerts; leave blank to disable.", HttpsUrl(),
     ),

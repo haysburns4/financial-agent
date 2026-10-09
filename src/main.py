@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from contextlib import asynccontextmanager
 
@@ -6,10 +7,11 @@ from loguru import logger
 
 from src.backtest import persistence as backtest_persistence
 from src.config import settings
-from src.db import engine, init_db
+from src.db import engine, get_connection, init_db
 from src.etrade.auth import auth
 from src.llm import health as llm_health
-from src.scheduler import build_scheduler
+from src.portfolio_history import history_summary
+from src.scheduler import build_scheduler, portfolio_history_pipeline
 from src.server import create_app
 
 
@@ -46,17 +48,36 @@ async def lifespan(app):
     # A local LLM that is down is reported here, not when a chat request hangs.
     llm_summary = await llm_health.log_startup(llm_health.MONITOR)
     logger.info(
-        "Ready: E-Trade {}; {}",
+        "Ready: E-Trade {}; {}; {}",
         "tokens loaded" if etrade_ready else "needs OAuth",
         llm_summary,
+        await _history_banner(),
     )
+
+    # Record snapshot of posiitons on startup
+    startup_snapshot: asyncio.Task | None = None
+    if settings.SNAPSHOT_ON_STARTUP:
+        startup_snapshot = asyncio.create_task(portfolio_history_pipeline.run(source="startup"))
 
     try:
         yield
     finally:
+        if startup_snapshot is not None:
+            startup_snapshot.cancel()
         scheduler.shutdown(wait=False)
         await engine.dispose()
         logger.info("Shutdown complete")
+
+
+async def _history_banner() -> str:
+    async with get_connection() as conn:
+        summary = await history_summary(conn)
+    if summary["latest_snapshot_date"] is None:
+        return "portfolio history: none yet"
+    return (
+        f"portfolio history: latest snapshot {summary['latest_snapshot_date']}, "
+        f"{summary['snapshot_dates_recorded']} day(s) recorded"
+    )
 
 
 app = create_app()

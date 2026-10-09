@@ -1,6 +1,7 @@
-from datetime import datetime
+from datetime import date, datetime, timezone
 
 from sqlalchemy import (
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -15,6 +16,10 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
     pass
+
+
+def as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
 
 
 class PriceBar(Base):
@@ -72,6 +77,34 @@ class Position(Base):
 
     __table_args__ = (
         UniqueConstraint("account_id", "ticker", name="uq_positions_account_ticker"),
+    )
+
+
+class PositionSnapshot(Base):
+    __tablename__ = "position_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    snapshot_date: Mapped[date] = mapped_column(Date, index=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    capture_source: Mapped[str] = mapped_column(String(20))  # startup | manual | scheduled
+    market_state: Mapped[str] = mapped_column(String(20))
+    account_id: Mapped[str] = mapped_column(String(50), index=True)
+    ticker: Mapped[str] = mapped_column(String(10), index=True)
+    quantity: Mapped[float]
+    cost_basis: Mapped[float]
+    market_value: Mapped[float]
+    pnl: Mapped[float]
+    pnl_pct: Mapped[float | None]
+    positions_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_date", "account_id", "ticker", name="uq_position_snapshots_date_account_ticker"
+        ),
+        Index("ix_position_snapshots_date_account", "snapshot_date", "account_id"),
     )
 
 
