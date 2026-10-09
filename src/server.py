@@ -24,13 +24,13 @@ from src.pipelines import monitored_tickers
 from src.portfolio import dashboard, position_dict, risk_by_account, risk_summary
 from src.portfolio_history import coverage, history_rows, history_summary
 from src.pipelines.backfill_pipeline import BackfillPipeline
-from src.pipelines.snapshot_pipeline import SnapshotRunResult
+from src.pipelines.portfolio_history_pipeline import SnapshotRunResult
 from src.scheduler import (
     agent_chat,
+    portfolio_history_pipeline,
     portfolio_pipeline,
     price_pipeline,
     signal_synthesizer,
-    snapshot_pipeline,
 )
 from src.signals.engine import FILTER_STATS, SIGNAL_CATEGORIES, signal_types_for_category
 
@@ -129,8 +129,8 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         # Startup usually comes before the (interactive) login, so its snapshot
         # is missing or copied stale positions. Capture again.
-        if settings.SNAPSHOT_ON_STARTUP and await snapshot_pipeline.needs_capture():
-            background.add_task(snapshot_pipeline.run, source="startup")
+        if settings.SNAPSHOT_ON_STARTUP and await portfolio_history_pipeline.needs_capture():
+            background.add_task(portfolio_history_pipeline.run, source="startup")
         return {"authenticated": True}
 
     @app.post("/auth/logout")
@@ -360,10 +360,10 @@ def create_app() -> FastAPI:
             "errors": result.errors,
         }
 
-    @app.post("/pipeline/snapshot/run")
-    async def trigger_snapshot_run(body: SnapshotRunRequest | None = None):
+    @app.post("/pipeline/portfolio_history/run")
+    async def trigger_portfolio_history_run(body: SnapshotRunRequest | None = None):
         # Never raises: an E-Trade or DB problem is reported in `errors`.
-        result = await snapshot_pipeline.run(
+        result = await portfolio_history_pipeline.run(
             source="manual", refresh_first=(body or SnapshotRunRequest()).refresh_first
         )
         return _snapshot_result(result)
