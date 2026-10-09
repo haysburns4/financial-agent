@@ -2,9 +2,11 @@ from dataclasses import asdict
 from datetime import date, timezone
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import and_, func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from src.agui import create_agui_router
@@ -20,9 +22,12 @@ from src.llm import health as llm_health
 from src.models import Indicator, PipelineRun, Position, PriceBar, Signal
 from src.pipelines import monitored_tickers
 from src.portfolio import dashboard, position_dict, risk_by_account, risk_summary
+from src.portfolio_history import coverage, history_rows, history_summary
 from src.pipelines.backfill_pipeline import BackfillPipeline
+from src.pipelines.portfolio_history_pipeline import SnapshotRunResult
 from src.scheduler import (
     agent_chat,
+    portfolio_history_pipeline,
     portfolio_pipeline,
     price_pipeline,
     signal_synthesizer,
@@ -32,6 +37,11 @@ from src.signals.engine import FILTER_STATS, SIGNAL_CATEGORIES, signal_types_for
 
 class CompleteAuthBody(BaseModel):
     verifier: str
+
+
+class SnapshotRunRequest(BaseModel):
+    # Pull positions from E-Trade first if they are over 30 minutes old.
+    refresh_first: bool = True
 
 
 class BackfillRequest(BaseModel):
@@ -82,6 +92,13 @@ def create_app() -> FastAPI:
     async def health():
         ok = await health_check()
         llm, alerts = await llm_health.llm_health(llm_health.MONITOR)
+        history = None
+        if ok:
+            try:
+                async with get_connection() as conn:
+                    history = await history_summary(conn)
+            except SQLAlchemyError:
+                logger.exception("health: portfolio history unavailable")
         # `service` lets the launcher recognise an instance it can reuse.
         # A down local LLM degrades the service: market data still collects.
         return {
@@ -89,6 +106,7 @@ def create_app() -> FastAPI:
             "db": ok,
             "llm": llm,
             "alerts": alerts,
+            "portfolio_history": history,
             "service": "financial-agent",
             # Daily-trend confirmation of 5-minute signals; in memory, so it
             # counts from the API's last restart within the 24h window.
@@ -104,11 +122,15 @@ def create_app() -> FastAPI:
         return {"auth_url": url}
 
     @app.post("/auth/complete")
-    async def auth_complete(body: CompleteAuthBody):
+    async def auth_complete(body: CompleteAuthBody, background: BackgroundTasks):
         try:
             await auth.complete_auth(body.verifier)
         except ETradeAuthError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # Startup usually comes before the (interactive) login, so its snapshot
+        # is missing or copied stale positions. Capture again.
+        if settings.SNAPSHOT_ON_STARTUP and await portfolio_history_pipeline.needs_capture():
+            background.add_task(portfolio_history_pipeline.run, source="startup")
         return {"authenticated": True}
 
     @app.post("/auth/logout")
@@ -286,6 +308,36 @@ def create_app() -> FastAPI:
             "authenticated": await auth.is_authenticated(),
         }
 
+    @app.get("/portfolio/history")
+    async def portfolio_history(
+        account_id: str | None = None,
+        ticker: str | None = None,
+        start: date | None = None,
+        end: date | None = None,
+        limit: int = Query(500, ge=1, le=10_000),
+        conn: AsyncConnection = Depends(_conn_dep),
+    ):
+        """Snapshot rows, newest trading day first: a flat list for one account,
+        else grouped by account. `limit` caps the rows before grouping."""
+        rows = await history_rows(
+            conn,
+            account_id=account_id,
+            ticker=ticker.strip().upper() if ticker else None,
+            start=start,
+            end=end,
+            limit=limit,
+        )
+        if account_id is not None:
+            return rows
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            grouped.setdefault(row["account_id"], []).append(row)
+        return grouped
+
+    @app.get("/portfolio/history/coverage")
+    async def portfolio_history_coverage(conn: AsyncConnection = Depends(_conn_dep)):
+        return await coverage(conn)
+
     @app.get("/portfolio/risk")
     async def portfolio_risk(conn: AsyncConnection = Depends(_conn_dep)):
         rows = (await conn.execute(select(Position))).all()
@@ -307,6 +359,14 @@ def create_app() -> FastAPI:
             "accounts": result.accounts,
             "errors": result.errors,
         }
+
+    @app.post("/pipeline/portfolio_history/run")
+    async def trigger_portfolio_history_run(body: SnapshotRunRequest | None = None):
+        # Never raises: an E-Trade or DB problem is reported in `errors`.
+        result = await portfolio_history_pipeline.run(
+            source="manual", refresh_first=(body or SnapshotRunRequest()).refresh_first
+        )
+        return _snapshot_result(result)
 
     @app.post("/pipeline/backfill/run")
     async def trigger_backfill(body: BackfillRequest | None = None):
@@ -536,6 +596,14 @@ def create_app() -> FastAPI:
         }
 
     return app
+
+
+def _snapshot_result(result: SnapshotRunResult) -> dict:
+    return {
+        **asdict(result),
+        "snapshot_date": result.snapshot_date.isoformat(),
+        "captured_at": result.captured_at.isoformat(),
+    }
 
 
 async def _conn_dep():

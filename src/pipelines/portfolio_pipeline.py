@@ -35,7 +35,7 @@ class PortfolioPipeline:
     async def run(self) -> PortfolioRunResult:
         started = datetime.now(timezone.utc)
 
-        if not etrade_auth.is_authenticated():
+        if not await etrade_auth.is_authenticated():
             logger.warning("portfolio_pipeline skipped: E-Trade not authenticated")
             return PortfolioRunResult(
                 started_at=started,

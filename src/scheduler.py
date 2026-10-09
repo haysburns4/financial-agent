@@ -20,6 +20,7 @@ from src.llm import backend_for
 from src.pipelines import monitored_tickers
 from src.pipelines.portfolio_pipeline import PortfolioPipeline
 from src.pipelines.price_pipeline import PricePipeline
+from src.pipelines.portfolio_history_pipeline import PortfolioHistoryPipeline
 from src.signals.engine import SignalEngine
 
 
@@ -46,6 +47,7 @@ market_client = ETradeMarketClient(auth)
 account_client = ETradeAccountClient(auth)
 price_pipeline = PricePipeline(market_client, engine)
 portfolio_pipeline = PortfolioPipeline(account_client, engine)
+portfolio_history_pipeline = PortfolioHistoryPipeline(engine, portfolio=portfolio_pipeline)
 signal_engine = SignalEngine(engine)
 # Each task asks for its own backend; provider routing lives in src/llm/factory.py.
 signal_synthesizer = SignalSynthesizer(backend_for("synthesizer"))
@@ -134,4 +136,13 @@ def build_scheduler() -> BackgroundScheduler:
         coalesce=True,
         misfire_grace_time=3600,
     )
+    # Position snapshots are taken on startup and after login (src/main.py,
+    # src/server.py), not here.
+    # TODO: Once it runs continuously, register the daily close:
+    #   scheduler.add_job(
+    #       lambda: asyncio.run(portfolio_history_pipeline.run(source="scheduled")),
+    #       trigger=CronTrigger(hour=16, minute=30, timezone=_NYSE_TZ),
+    #       id="portfolio_history_pipeline", name="portfolio_history_pipeline",
+    #       max_instances=1, coalesce=True, misfire_grace_time=3600,
+    #   )
     return scheduler

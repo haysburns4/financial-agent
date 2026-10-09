@@ -41,6 +41,7 @@ class Settings(BaseSettings):
 
     PRICE_POLL_MINUTES: int = 5
     PORTFOLIO_POLL_MINUTES: int = 15
+    SNAPSHOT_ON_STARTUP: bool = True
 
     DISCORD_WEBHOOK_URL: str | None = None
 
