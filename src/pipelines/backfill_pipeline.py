@@ -56,6 +56,11 @@ def _none_if_nan(value: Any) -> float | None:  # anti-slop: allow no-any-paramet
     return None if math.isnan(f) else f
 
 
+def _yf_symbol(ticker: str) -> str:
+    """Writes share classes with a dash."""
+    return ticker.replace(".", "-")
+
+
 def _flatten_yf_frame(df: pd.DataFrame) -> pd.DataFrame:
     """yfinance returns MultiIndex columns even for single-ticker calls in
     1.x; flatten to single-level Open/High/Low/Close/Volume."""
@@ -215,7 +220,7 @@ class BackfillPipeline:
         logger.info("Backfilling {}: fetching {} daily bars...", ticker, period_daily)
         daily_df = await asyncio.to_thread(
             yf.download,
-            ticker,
+            _yf_symbol(ticker),
             period=period_daily,
             interval="1d",
             auto_adjust=True,
@@ -242,7 +247,7 @@ class BackfillPipeline:
         )
         intraday_df = await asyncio.to_thread(
             yf.download,
-            ticker,
+            _yf_symbol(ticker),
             period=period_intraday,
             interval=interval_intraday,
             auto_adjust=True,
