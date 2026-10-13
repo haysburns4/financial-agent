@@ -9,6 +9,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from src.agent.archive import archive_summary, get_output, list_outputs
 from src.agui import create_agui_router
 from src.alerts.discord import build_synthesis_context
 from src.backtest import persistence as backtest_persistence
@@ -82,6 +83,8 @@ class ChatRequest(BaseModel):
     conversation_history: list[ChatTurn] | None = None
     # The highlighted account, analyzed by default; omit for every account.
     account_id: str | None = None
+    # From a previous response, to thread this turn into that conversation.
+    conversation_id: str | None = None
 
 
 def create_app() -> FastAPI:
@@ -92,13 +95,14 @@ def create_app() -> FastAPI:
     async def health():
         ok = await health_check()
         llm, alerts = await llm_health.llm_health(llm_health.MONITOR)
-        history = None
+        history = archive = None
         if ok:
             try:
                 async with get_connection() as conn:
                     history = await history_summary(conn)
+                    archive = await archive_summary(conn)
             except SQLAlchemyError:
-                logger.exception("health: portfolio history unavailable")
+                logger.exception("health: portfolio history or agent archive unavailable")
         # `service` lets the launcher recognise an instance it can reuse.
         # A down local LLM degrades the service: market data still collects.
         return {
@@ -107,9 +111,8 @@ def create_app() -> FastAPI:
             "llm": llm,
             "alerts": alerts,
             "portfolio_history": history,
+            "agent_archive": archive,
             "service": "financial-agent",
-            # Daily-trend confirmation of 5-minute signals; in memory, so it
-            # counts from the API's last restart within the 24h window.
             "signal_filter_stats": {"last_24h": FILTER_STATS.last_24h()},
         }
 
@@ -307,6 +310,41 @@ def create_app() -> FastAPI:
             "last_updated": last_updated.isoformat() if last_updated else None,
             "authenticated": await auth.is_authenticated(),
         }
+
+    # Literal paths before /agent/history/{output_id}, whose int converter
+    # also keeps "undelivered" from matching it.
+    @app.get("/agent/history/undelivered")
+    async def agent_history_undelivered(
+        type: Literal["synthesis", "chat"] = "synthesis",
+        limit: int = Query(100, ge=1, le=1000),
+        conn: AsyncConnection = Depends(_conn_dep),
+    ):
+        """Outputs no delivery channel has claimed yet, newest first."""
+        return await list_outputs(conn, output_type=type, undelivered=True, limit=limit)
+
+    @app.get("/agent/history")
+    async def agent_history(
+        type: Literal["synthesis", "chat"] | None = None,
+        conversation_id: str | None = None,
+        ticker: str | None = None,
+        start: date | None = None,
+        end: date | None = None,
+        limit: int = Query(100, ge=1, le=1000),
+        conn: AsyncConnection = Depends(_conn_dep),
+    ):
+        """Archived syntheses and chat turns, newest first; `start`/`end` are
+        inclusive UTC dates."""
+        return await list_outputs(
+            conn, output_type=type, conversation_id=conversation_id, ticker=ticker,
+            start=start, end=end, limit=limit,
+        )
+
+    @app.get("/agent/history/{output_id:int}")
+    async def agent_history_item(output_id: int, conn: AsyncConnection = Depends(_conn_dep)):
+        output = await get_output(conn, output_id)
+        if output is None:
+            raise HTTPException(status_code=404, detail=f"no agent output {output_id}")
+        return output
 
     @app.get("/portfolio/history")
     async def portfolio_history(
@@ -541,7 +579,7 @@ def create_app() -> FastAPI:
             else None
         )
         try:
-            return await agent_chat.ask(body.question, history, body.account_id)
+            return await agent_chat.ask(body.question, history, body.account_id, body.conversation_id)
         except Exception as exc:
             from loguru import logger
             logger.exception("/chat failed")

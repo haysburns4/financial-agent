@@ -162,6 +162,16 @@ SPEC: tuple[SettingSpec, ...] = (
         Integer(1, 3600),
     ),
     SettingSpec(
+        "LLM_CONTEXT_BUDGET", "120000", False,
+        "Prompt tokens per request for hosted providers; archived memory fills what the prompt leaves.",
+        Integer(1000, 2_000_000),
+    ),
+    SettingSpec(
+        "LOCAL_LLM_CONTEXT_BUDGET", "24000", False,
+        "Provider local: prompt tokens per request; keep it plus the reply under the model's context window.",
+        Integer(1000, 2_000_000),
+    ),
+    SettingSpec(
         "LLM_PROVIDER_CHAT", None, False,
         "Provider for the chat agent; blank uses LLM_PROVIDER.", Choice(PROVIDERS),
     ),

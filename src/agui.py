@@ -109,7 +109,7 @@ async def _run(
 
         account_id = highlighted_account(body.context or ())
 
-        async for delta in chat.ask_stream(question, history, account_id):
+        async for delta in chat.ask_stream(question, history, account_id, body.thread_id):
             if isinstance(delta, TextDelta):
                 if not text_open:
                     yield encoder.encode(

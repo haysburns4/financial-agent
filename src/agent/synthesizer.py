@@ -1,14 +1,24 @@
 """Signal synthesizer — turn a batch of raw signals into a concise briefing.
 
 Goes through the provider-neutral LLM layer. Given a list of signal dicts plus context
-(positions and recent bars per ticker), asks Claude to produce a ≤200-word
+(positions and recent bars per ticker), asks the model for a ≤200-word
 actionable briefing. Callers (Discord alerter, /signals/synthesize endpoint)
 substitute this narrative for raw per-signal posts.
+
+The signals and their context are the input. Background comes from memory
+(src/agent/memory.py): the prior briefings on the same tickers, so a briefing
+says what changed instead of repeating yesterday's. Every briefing is archived
+(src/agent/archive.py) whatever the caller does with it — scheduled runs with
+no delivery channel included.
 """
+import time
 from typing import Any
 
 from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from src.agent.archive import record_output
+from src.agent.memory import AssembledContext, build_context, context_budget, estimate_tokens
 from src.llm import LLMBackend, Message, collect
 
 
@@ -18,8 +28,11 @@ _SYSTEM_PROMPT = (
     "Produce a concise, actionable briefing. State what signals fired, why "
     "they matter given the portfolio context, and what the user should "
     "consider. Never give direct buy/sell advice — frame as 'consider', "
-    "'worth watching', 'may warrant review'. Keep it under 200 words."
+    "'worth watching', 'may warrant review'. Keep it under 200 words. "
+    "If earlier briefings are included as background, do not present what "
+    "they already said as new: say what has changed since, or that it persists."
 )
+_BACKGROUND_INTRO = "\n\n# Background (from earlier runs; may be out of date)\n\n"
 
 
 class SignalSynthesizer:
@@ -27,8 +40,9 @@ class SignalSynthesizer:
     # tokens from this same budget; too low and they return an empty briefing.
     MAX_TOKENS = 8_000
 
-    def __init__(self, backend: LLMBackend) -> None:
+    def __init__(self, backend: LLMBackend, engine: AsyncEngine) -> None:
         self._backend = backend
+        self._engine = engine
 
     async def synthesize(self, signals: list[dict], context: dict) -> str:
         """Produce a narrative summary for the given signals.
@@ -41,7 +55,12 @@ class SignalSynthesizer:
         """
         if not signals:
             return "No new signals."
+        started = time.monotonic()
+        tickers = sorted({str(s["ticker"]).upper() for s in signals if s.get("ticker")})
         user_message = self._render_user_message(signals, context)
+        memory = await self._background(tickers, _SYSTEM_PROMPT + user_message + _BACKGROUND_INTRO)
+        if memory is not None and memory.sections:
+            user_message += _BACKGROUND_INTRO + memory.render()
         response = await collect(
             self._backend.stream(
                 system=_SYSTEM_PROMPT,
@@ -50,6 +69,24 @@ class SignalSynthesizer:
             )
         )
         text = response.text.strip()
+        if text:
+            await record_output(
+                self._engine,
+                "synthesis",
+                text,
+                self._backend.provider,
+                self._backend.model,
+                context_ref={
+                    "signal_ids": [s["id"] for s in signals if s.get("id") is not None],
+                    "tickers": tickers,
+                    "account_ids": sorted(
+                        {p["account_id"] for p in context.get("positions") or [] if p.get("account_id")}
+                    ),
+                    "signal_count": len(signals),
+                    "memory": memory.summary() if memory is not None else None,
+                },
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
         logger.info(
             "synthesizer: {} signal(s) -> {} char briefing "
             "({} in / {} out tokens, {}/{})",
@@ -61,6 +98,15 @@ class SignalSynthesizer:
             self._backend.model,
         )
         return text
+
+    async def _background(self, tickers: list[str], prompt_so_far: str) -> AssembledContext | None:
+        """Prior briefings and the latest snapshot for `tickers`."""
+        budget = max(0, context_budget("synthesis") - estimate_tokens(prompt_so_far))
+        try:
+            return await build_context(self._engine, "synthesis", budget, scope_tickers=tickers)
+        except Exception:
+            logger.exception("synthesizer: memory unavailable; briefing without background")
+            return None
 
     @staticmethod
     def _render_user_message(signals: list[dict], context: dict) -> str:

@@ -5,6 +5,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    JSON,
     LargeBinary,
     String,
     Text,
@@ -118,10 +119,73 @@ class Signal(Base):
     direction: Mapped[str | None] = mapped_column(String(10))
     confidence: Mapped[float]
     reasoning: Mapped[str] = mapped_column(Text)
+    # Set by the Discord tick (src/alerts/discord.py) once a signal is posted.
+    # TODO: One flag covers one channel; a second channel would never see what
+    # the first already claimed. Before adding one, move delivery to a
+    # signal_deliveries table keyed (signal_id, channel), claim rows with an
+    # UPDATE ... WHERE delivered IS false RETURNING so two workers can't both
+    # send, and drop this column.
     delivered: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class AgentOutput(Base):
+    """Everything the agent said (and was asked), kept with its provenance.
+
+    Rows are immutable: content is never updated in place, so `content_hash`
+    always describes `content` — a re-embedding pass can skip rows whose hash
+    it has seen, and find the ones a new embedding model has not. Changed
+    content is a new row. Nothing assumes one row is one retrieval chunk.
+    """
+
+    __tablename__ = "agent_outputs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    output_type: Mapped[str] = mapped_column(String(20))  # synthesis | chat
+    role: Mapped[str | None] = mapped_column(String(20))  # user | assistant; None for synthesis
+    content: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)  # sha256 hex of content
+    provider: Mapped[str] = mapped_column(String(30))
+    model: Mapped[str] = mapped_column(String(120))
+    conversation_id: Mapped[str | None] = mapped_column(String(40), index=True)
+    context_ref: Mapped[dict | None] = mapped_column(JSON)
+    latency_ms: Mapped[int | None]
+    # For a future delivery channel to claim syntheses, like signals.delivered.
+    # TODO: Nothing sets this yet, so /agent/history/undelivered and /health's
+    # undelivered_syntheses just mirror the full synthesis history. When a
+    # channel (Discord, email) starts sending syntheses, have it read
+    # list_outputs(undelivered=True) and set the flag right after each
+    # successful send, as discord.py does for signals. If syntheses ever go to
+    # more than one channel, use a per-channel deliveries table instead, as
+    # noted on Signal.delivered.
+    delivered: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (Index("ix_agent_outputs_type_timestamp", "output_type", "timestamp"),)
+
+
+class AgentOutputRef(Base):
+    """What an agent output refers to, one row per reference, for filtering.
+
+    Derived from the output's context_ref on insert. Retrieval over the archive
+    filters by ticker (and date) before or alongside any vector search, so
+    "every narrative mentioning NVDA in September" is an indexed join here
+    rather than a scan of JSON.
+    """
+
+    __tablename__ = "agent_output_refs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    output_id: Mapped[int] = mapped_column(ForeignKey("agent_outputs.id"), index=True)
+    ref_type: Mapped[str] = mapped_column(String(20))  # ticker | signal_id | account_id
+    ref_value: Mapped[str] = mapped_column(String(50))
+
+    __table_args__ = (Index("ix_agent_output_refs_type_value", "ref_type", "ref_value"),)
 
 
 class PipelineRun(Base):

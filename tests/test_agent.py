@@ -168,9 +168,9 @@ async def test_ask_stream_yields_deltas_then_the_terminal_event(engine):
 # ---------- synthesizer ----------
 
 
-async def test_synthesize_returns_the_briefing():
+async def test_synthesize_returns_the_briefing(engine):
     backend = FakeBackend(text_reply("Two entries fired; both worth watching."))
-    narrative = await SignalSynthesizer(backend).synthesize(
+    narrative = await SignalSynthesizer(backend, engine).synthesize(
         [{"ticker": "AAPL", "signal_type": "breakout", "direction": "up", "confidence": 0.7,
           "reasoning": "closed above range", "timestamp": None}],
         {"positions": [], "bars_by_ticker": {}},
@@ -178,9 +178,9 @@ async def test_synthesize_returns_the_briefing():
     assert narrative == "Two entries fired; both worth watching."
 
 
-async def test_synthesize_short_circuits_on_no_signals():
+async def test_synthesize_short_circuits_on_no_signals(engine):
     backend = FakeBackend(text_reply("unused"))
-    assert await SignalSynthesizer(backend).synthesize([], {}) == "No new signals."
+    assert await SignalSynthesizer(backend, engine).synthesize([], {}) == "No new signals."
     assert backend.calls == []  # no provider call, no spend
 
 
