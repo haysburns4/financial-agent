@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     LOCAL_LLM_BASE_URL: str = "http://localhost:8080/v1"
     LOCAL_LLM_MODEL: str = "mlx-community/Qwen3-14B-4bit"
     LOCAL_LLM_TIMEOUT_SECONDS: int = 180
+    LLM_CONTEXT_BUDGET: int = 120_000
+    LOCAL_LLM_CONTEXT_BUDGET: int = 24_000
 
     # Per-task provider overrides; unset means LLM_PROVIDER. Resolved in one
     # place, src/llm/factory.py backend_for(task).

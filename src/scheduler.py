@@ -50,7 +50,7 @@ portfolio_pipeline = PortfolioPipeline(account_client, engine)
 portfolio_history_pipeline = PortfolioHistoryPipeline(engine, portfolio=portfolio_pipeline)
 signal_engine = SignalEngine(engine)
 # Each task asks for its own backend; provider routing lives in src/llm/factory.py.
-signal_synthesizer = SignalSynthesizer(backend_for("synthesizer"))
+signal_synthesizer = SignalSynthesizer(backend_for("synthesizer"), engine)
 agent_chat = AgentChat(engine, backend_for("chat"))
 
 
