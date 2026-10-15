@@ -8,7 +8,7 @@ from sqlalchemy import insert
 from src.agent import tools
 from src.agent.tools import TOOLS, data_summary, run_tool
 from src.llm import ToolCall
-from src.models import Position, Signal
+from src.models import Indicator, Position, PriceBar, Signal
 
 
 async def _seed(engine):
@@ -152,6 +152,33 @@ async def test_price_history_clamps_untrusted_limits(engine, arguments):
 
     assert not result.is_error
     assert payload["bar_count"] == 0  # no bars seeded; the point is it did not raise
+
+
+async def _bar(engine, ticker: str, ts: datetime, rsi: float | None) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(insert(PriceBar), [{
+            "ticker": ticker, "timestamp": ts, "open": 100.0, "high": 100.0, "low": 100.0,
+            "close": 177.89990234375, "volume": 1000.0, "adjusted_close": 100.0,
+        }])
+        await conn.execute(insert(Indicator), [{"ticker": ticker, "timestamp": ts, "rsi_14": rsi}])
+
+
+async def test_screen_indicators_ranks_the_latest_bar_of_each_ticker_by_rsi(engine, monkeypatch):
+    await _seed(engine)
+    monkeypatch.setattr(tools.settings, "WATCHLIST", ["NUE", "V"])
+    now = datetime(2026, 10, 12, 17, 30, tzinfo=timezone.utc)
+    await _bar(engine, "AAPL", now - timedelta(days=1), 20.0)  # superseded by the newer bar
+    await _bar(engine, "AAPL", now, 61.234567)
+    await _bar(engine, "NUE", now, 28.5)
+    await _bar(engine, "MSFT", now, None)
+
+    _, payload = await _call(engine, "screen_indicators", {"account_id": "all"})
+
+    assert [(r["ticker"], r["rsi_14"], r["held"]) for r in payload["tickers"]] == [
+        ("NUE", 28.5, False), ("AAPL", 61.23, True), ("MSFT", None, True),
+    ]
+    assert payload["tickers"][0]["close"] == 177.9  # float noise rounded off
+    assert payload["no_indicators"] == ["V"]
 
 
 async def test_unknown_tool_is_reported_not_raised(engine):

@@ -20,6 +20,7 @@ from loguru import logger
 from sqlalchemy import Row, and_, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from src.config import settings
 from src.llm import ToolCall, ToolDef, ToolResult
 from src.models import Indicator, Position, PriceBar, Signal
 from src.portfolio import position_dict, risk_by_account
@@ -102,10 +103,24 @@ TOOLS: tuple[ToolDef, ...] = (
         },
     ),
     ToolDef(
+        name="screen_indicators",
+        description=(
+            "The latest close, RSI, MACD histogram and EMAs for every watchlist "
+            "ticker and every ticker held in the account, one row each, lowest "
+            "RSI first. Use to compare or rank tickers (e.g. which are oversold) "
+            "instead of calling get_price_history per ticker."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"account_id": _account_arg("holdings")},
+        },
+    ),
+    ToolDef(
         name="get_price_history",
         description=(
             "Recent price bars for one ticker with their RSI, MACD and EMA values. "
-            "Use for trend, momentum or 'what is the indicator doing' questions."
+            "Use for trend, momentum or 'what is the indicator doing' questions "
+            "about a single ticker; to compare tickers, use screen_indicators."
         ),
         parameters={
             "type": "object",
@@ -140,7 +155,7 @@ async def run_tool(engine: AsyncEngine, call: ToolCall, highlighted: str | None 
         logger.exception("tool: {} failed", call.name)
         return ToolResult(call.id, f"{type(exc).__name__}: {exc}", is_error=True)
 
-    content = json.dumps(payload, default=str)
+    content = json.dumps(_rounded(payload), default=str)
     logger.info("tool: {}({}) -> {} chars", call.name, call.arguments, len(content))
     return ToolResult(call.id, content)
 
@@ -295,10 +310,40 @@ async def _get_price_history(conn: AsyncConnection, args: dict, highlighted: str
     }
 
 
+async def _screen_indicators(conn: AsyncConnection, args: dict, highlighted: str | None) -> dict:
+    held_stmt = select(distinct(Position.ticker))
+    if account_id := await _account_scope(conn, args, highlighted):
+        held_stmt = held_stmt.where(Position.account_id == account_id)
+    held = set((await conn.scalars(held_stmt)).all())
+    tickers = held | set(settings.WATCHLIST)
+
+    latest = (
+        select(Indicator.ticker, func.max(Indicator.timestamp).label("timestamp"))
+        .where(Indicator.ticker.in_(tickers))
+        .group_by(Indicator.ticker)
+        .subquery()
+    )
+    stmt = (
+        select(
+            Indicator.ticker, Indicator.timestamp, PriceBar.close,
+            Indicator.rsi_14, Indicator.macd_hist, Indicator.ema_9, Indicator.ema_21,
+        )
+        .join(latest, and_(Indicator.ticker == latest.c.ticker, Indicator.timestamp == latest.c.timestamp))
+        .outerjoin(PriceBar, and_(PriceBar.ticker == Indicator.ticker, PriceBar.timestamp == Indicator.timestamp))
+    )
+    rows = [{**r._mapping, "held": r.ticker in held} for r in (await conn.execute(stmt)).all()]
+    rows.sort(key=lambda r: (r["rsi_14"] is None, r["rsi_14"] or 0.0))
+    return {
+        "tickers": rows,
+        "no_indicators": sorted(tickers - {r["ticker"] for r in rows}),
+    }
+
+
 _HANDLERS = {
     "get_positions": _get_positions,
     "get_portfolio_risk": _get_portfolio_risk,
     "get_signals": _get_signals,
+    "screen_indicators": _screen_indicators,
     "get_price_history": _get_price_history,
 }
 assert {t.name for t in TOOLS} == set(_HANDLERS), "TOOLS and _HANDLERS disagree"
@@ -320,6 +365,19 @@ def _text(value: Any) -> str | None:  # anti-slop: allow no-any-parameters - thi
 def _ticker(value: Any) -> str | None:  # anti-slop: allow no-any-parameters - this IS the parse boundary for model-supplied JSON
     text = _text(value)
     return text.upper() if text else None
+
+
+def _rounded(value: object) -> object:
+    """`value` with floats cut to two decimals, or four below 1. The model
+    reads every digit as a token, and float noise (177.89990234375) was most of
+    a price-history payload."""
+    if isinstance(value, float):
+        return round(value, 2) if abs(value) >= 1 else round(value, 4)
+    if isinstance(value, dict):
+        return {k: _rounded(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_rounded(v) for v in value]
+    return value
 
 
 def _clamp(value: Any, *, default: int, low: int, high: int) -> int:  # anti-slop: allow no-any-parameters - this IS the parse boundary for model-supplied JSON

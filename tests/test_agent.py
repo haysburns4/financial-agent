@@ -94,7 +94,9 @@ async def test_the_tool_surface_is_offered_to_the_model(engine, backend):
     await AgentChat(engine, backend).ask("anything")
 
     names = {t.name for t in backend.calls[0]["tools"]}
-    assert {"get_positions", "get_portfolio_risk", "get_signals", "get_price_history"} == names
+    assert {
+        "get_positions", "get_portfolio_risk", "get_signals", "screen_indicators", "get_price_history",
+    } == names
 
 
 async def test_system_prompt_orients_without_dumping_the_data(engine, backend):
@@ -118,6 +120,20 @@ async def test_agent_runs_a_tool_then_answers_with_the_result(engine, backend):
     assert result["answer"] == "You hold 1 position."
     assert result["context_used"]["tools_called"] == [{"name": "get_positions", "arguments": {}}]
     assert len(backend.calls) == 2
+
+
+async def test_a_tool_result_too_big_for_the_context_is_withheld(engine):
+    # 13 price histories at ~8k tokens each overran a 24k local window and
+    # crashed the MLX server. The model must get an error it can act on instead.
+    await _seed_position(engine)
+    backend = FakeBackend([tool_reply("get_positions", {}), text_reply("done")])
+
+    await AgentChat(engine, backend, context_tokens=0).ask("holdings?")
+
+    result = backend.calls[1]["messages"][-1].tool_results[0]
+    assert result.is_error
+    assert "does not fit" in result.content
+    assert "AAPL" not in result.content
 
 
 async def test_tool_results_are_replayed_as_a_user_turn(engine):

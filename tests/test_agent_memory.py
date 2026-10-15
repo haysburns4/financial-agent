@@ -336,3 +336,10 @@ async def test_archive_summary_counts_for_health(engine):
         "total_outputs": 3, "syntheses": 1, "chat_turns": 2, "undelivered_syntheses": 1,
     }
     assert summary["latest_output_at"] is not None
+
+
+def test_estimate_tokens_counts_each_digit_and_mark():
+    # Qwen splits numbers digit by digit; at four characters a token, price
+    # JSON was undercounted about threefold.
+    assert estimate_tokens("abcdefgh") == 2
+    assert estimate_tokens("177.8999") == 8

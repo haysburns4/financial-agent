@@ -81,6 +81,13 @@ _TOOLS_TOKENS = estimate_tokens(
 # agent_outputs.conversation_id is 40 characters; longer ids are hashed to fit.
 _CONVERSATION_ID_MAX = 40
 
+_OVER_BUDGET_RESULT = (
+    "This result ({tokens} tokens) does not fit in the {room} tokens of context "
+    "left for this question, so it was not returned. Answer with what you have, "
+    "or ask for less: one ticker, fewer bars, or screen_indicators to compare "
+    "tickers."
+)
+
 _CUT_OFF_NOTE = (
     "\n\n_(The answer was cut off: the model reached its output limit. "
     "Try a narrower question.)_"
@@ -120,9 +127,11 @@ class AgentChat:
     # Ceiling on model -> tools -> model round trips within a single question.
     MAX_TOOL_ITERATIONS = 5
 
-    def __init__(self, engine: AsyncEngine, backend: LLMBackend) -> None:
+    def __init__(self, engine: AsyncEngine, backend: LLMBackend, context_tokens: int | None = None) -> None:
+        """`context_tokens` is the prompt budget; None takes the chat provider's."""
         self._engine = engine
         self._backend = backend
+        self._context_tokens = context_budget("chat") if context_tokens is None else context_tokens
 
     async def ask(
         self,
@@ -172,6 +181,9 @@ class AgentChat:
         memory = await self._background(system_prompt, messages, turn.conversation_id, highlighted)
         if memory is not None and memory.sections:
             system_prompt += _MEMORY_INTRO + memory.render()
+        room = self._context_tokens - _TOOLS_TOKENS - estimate_tokens(
+            system_prompt + "".join(m.text or "" for m in messages)
+        )
         # After memory is built, so the question is not its own background.
         await record_output(
             self._engine, "chat", question, self._backend.provider, self._backend.model,
@@ -181,7 +193,7 @@ class AgentChat:
 
         answer: list[str] = []
         tools_called: list[dict] = []
-        async for item in self._run(system_prompt, messages, highlighted):
+        async for item in self._run(system_prompt, messages, highlighted, room):
             if isinstance(item, TextDelta):
                 answer.append(item.text)
             elif isinstance(item, MessageComplete):
@@ -225,7 +237,7 @@ class AgentChat:
         definitions; None if memory is unavailable. Tool results arrive later
         and are not foreseen here."""
         used = estimate_tokens(system_prompt + _MEMORY_INTRO + "".join(m.text or "" for m in messages))
-        budget = max(0, context_budget("chat") - used - _TOOLS_TOKENS)
+        budget = max(0, self._context_tokens - used - _TOOLS_TOKENS)
         try:
             return await build_context(
                 self._engine, "chat", budget,
@@ -260,8 +272,11 @@ class AgentChat:
         system_prompt: str,
         messages: list[Message],
         highlighted: str | None,
+        room: int,
     ) -> AsyncIterator[Delta | ToolResult]:
-        """Drive model -> tools -> model until the model stops asking for tools."""
+        """Drive model -> tools -> model until the model stops asking for tools.
+        A result that would take the prompt past `room` tokens is withheld and
+        the model told why."""
         for _ in range(self.MAX_TOOL_ITERATIONS):
             final: MessageComplete | None = None
             try:
@@ -291,6 +306,14 @@ class AgentChat:
             results = []
             for call in final.message.tool_calls:
                 result = await run_tool(self._engine, call, highlighted)
+                tokens = estimate_tokens(result.content)
+                if tokens > room:
+                    logger.warning("chat: withheld {} result of ~{} tokens ({} left)", call.name, tokens, room)
+                    result = ToolResult(
+                        call.id, _OVER_BUDGET_RESULT.format(tokens=tokens, room=max(room, 0)), is_error=True
+                    )
+                    tokens = estimate_tokens(result.content)
+                room -= tokens
                 results.append(result)
                 yield result
             messages.append(Message(role="user", tool_results=tuple(results)))

@@ -48,10 +48,14 @@ _TRIMMED = " …[trimmed]"
 
 
 def estimate_tokens(text: str) -> int:
-    """APPROXIMATION: about four characters per token for English text. Real
-    counts vary by tokenizer and run higher for numbers and code; budgets
-    should leave headroom rather than rely on this being exact."""
-    return len(text) // 4
+    """APPROXIMATION: a token per digit and per punctuation mark, about four
+    characters per token for the rest. Qwen's tokenizer splits numbers digit by
+    digit, so plain characters/4 undercounted tool JSON about threefold; this
+    runs 5-25% over Qwen3's real count on both JSON and prose.
+    TODO: this shouldn't be solely for Qwen — make local models swappable."""
+    digits = sum(c.isdigit() for c in text)
+    marks = sum(not c.isalnum() and not c.isspace() for c in text)
+    return digits + marks + (len(text) - digits - marks) // 4
 
 
 def context_budget(task: MemoryTask, config: Settings = settings) -> int:
