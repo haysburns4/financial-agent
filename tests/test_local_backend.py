@@ -1,4 +1,4 @@
-"""LLM_PROVIDER=local: an OpenAI-compatible MLX server, behind the OpenAI backend.
+"""LLM_PROVIDER=local: any OpenAI-compatible server, behind the OpenAI backend.
 
 A real `openai.AsyncOpenAI` client over `httpx.MockTransport`, so the SDK's
 own SSE parsing and error types are exercised; only the server is fake.
@@ -8,13 +8,17 @@ import json
 import httpx
 import openai
 import pytest
+from loguru import logger
 
-from src.cli.checks import Status, check_local_server
+from src.cli.checks import LocalServerTarget, Status, check_local_server
 from src.llm import LLMConnectionError, Message, MessageComplete, TextDelta, ToolCallDelta, ToolDef, collect
+from src.llm.health import LocalServerMonitor
 from src.llm.local_backend import PLACEHOLDER_API_KEY, LocalBackend, make_client
+from src.llm.local_profiles import SERVERS, model_profile, thinking_off
 
 BASE = "http://mlx.test/v1"
 MODEL = "mlx-community/Qwen3-14B-4bit"
+TARGET = LocalServerTarget(BASE, "mlx.test", 80, MODEL)
 
 
 def _sse(*chunks: dict) -> bytes:
@@ -30,7 +34,7 @@ def _text(content: str, finish: str | None = None) -> dict:
 USAGE = {"choices": [], "usage": {"prompt_tokens": 32, "completion_tokens": 3, "total_tokens": 35}}
 
 
-def _backend(handler) -> tuple[LocalBackend, list[httpx.Request]]:
+def _backend(handler, model: str = MODEL, **options) -> tuple[LocalBackend, list[httpx.Request]]:
     seen: list[httpx.Request] = []
 
     def record(request: httpx.Request) -> httpx.Response:
@@ -41,7 +45,15 @@ def _backend(handler) -> tuple[LocalBackend, list[httpx.Request]]:
         base_url=BASE, api_key=PLACEHOLDER_API_KEY, max_retries=0,
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(record)),
     )
-    return LocalBackend(client, MODEL, BASE, 180), seen
+    return LocalBackend(client, model, BASE, 180, **options), seen
+
+
+@pytest.fixture
+def logs():
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(f"{m.record['level'].name} {m.record['message']}"))
+    yield lines
+    logger.remove(sink)
 
 
 def _stream(body: bytes):
@@ -116,6 +128,7 @@ async def test_tool_calls_in_mlx_single_chunk_form():
 
 
 async def test_a_server_that_is_down_is_named_not_a_raw_connection_error():
+    # The default server: the hint can offer ./start.
     def refuse(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("[Errno 61] Connection refused", request=request)
 
@@ -136,6 +149,163 @@ async def test_a_slow_server_points_at_the_timeout_setting():
     backend, _ = _backend(stall)
     with pytest.raises(LLMConnectionError, match="did not answer within 180s.*LOCAL_LLM_TIMEOUT_SECONDS"):
         await collect(backend.stream(system="s", messages=[Message(role="user", text="hi")]))
+
+
+async def test_the_default_request_is_unchanged():
+    # mlx + Qwen3, the out-of-the-box setup
+    backend, seen = _backend(_stream(_sse(_text("ok", "stop"))))
+    await collect(backend.stream(system="s", messages=[Message(role="user", text="hi")]))
+
+    assert json.loads(seen[0].content) == {
+        "model": MODEL,
+        "max_completion_tokens": 4096,
+        "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+
+@pytest.mark.parametrize("kind", SERVERS)
+async def test_each_server_gets_its_output_cap_and_thinking_switch(kind):
+    server = SERVERS[kind]
+    backend, seen = _backend(_stream(_sse(_text("ok", "stop"))), "qwen3:14b", server=server)
+    await collect(backend.stream(system="s", messages=[Message(role="user", text="hi")], max_tokens=500))
+    body = json.loads(seen[0].content)
+
+    other = {"max_tokens", "max_completion_tokens"} - {server.max_tokens_param}
+    assert body[server.max_tokens_param] == 500 and not other & set(body)
+    off = thinking_off(server, model_profile("qwen3:14b"))
+    assert body.get("chat_template_kwargs") == (dict(off.template_kwargs) or None)
+    assert body.get("reasoning_effort") == off.reasoning_effort
+    assert body["messages"][0]["content"] == "s" + off.system_suffix
+
+
+@pytest.mark.parametrize("kind", SERVERS)
+async def test_each_server_round_trips_a_tool_call_without_usage(kind):
+    # Some servers split the arguments over chunks; none is required to report usage.
+    first = {"choices": [{"index": 0, "finish_reason": None, "delta": {"tool_calls": [{
+        "index": 0, "id": "t1", "type": "function", "function": {"name": "get_positions", "arguments": '{"acc'},
+    }]}}]}
+    rest = {"choices": [{"index": 0, "finish_reason": None, "delta": {"tool_calls": [{
+        "index": 0, "function": {"arguments": 'ount_id": "A1"}'},
+    }]}}]}
+    done = {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+    backend, _ = _backend(_stream(_sse(first, rest, done)), "qwen3:14b", server=SERVERS[kind])
+    tool = ToolDef(name="get_positions", description="d", parameters={"type": "object", "properties": {}})
+
+    response = await collect(backend.stream(system="s", messages=[Message(role="user", text="q")], tools=[tool]))
+
+    assert response.stop_reason == "tool_use"
+    assert response.tool_calls[0].arguments == {"account_id": "A1"}
+    assert (response.usage.input_tokens, response.usage.output_tokens) == (0, 0)
+
+
+async def test_thinking_in_the_answer_text_is_stripped_from_deltas_and_the_message():
+    chunks = _sse(_text("<think>The user"), _text(" wants 4.</th"), _text("ink>\n\nFour"), _text(".", "stop"))
+    backend, _ = _backend(_stream(chunks), "deepseek-r1:8b", server=SERVERS["llamacpp"])
+    deltas = [d async for d in backend.stream(system="s", messages=[Message(role="user", text="2+2?")])]
+    shown = "".join(d.text for d in deltas if isinstance(d, TextDelta))
+
+    assert shown == "\n\nFour."
+    assert deltas[-1].message.text == shown
+
+
+async def test_a_model_that_never_thinks_inline_is_passed_through_untouched():
+    backend, _ = _backend(_stream(_sse(_text("a <think> is"), _text(" literal", "stop"))), "llama3.1:8b")
+    response = await collect(backend.stream(system="s", messages=[Message(role="user", text="q")]))
+
+    assert response.text == "a <think> is literal"
+
+
+@pytest.mark.parametrize(
+    ("model", "family", "expected"),
+    [
+        ("qwen3:14b", None, 8),  # every digit a token
+        ("llama3.1:8b", None, 4),  # seven digits in threes, plus the mark
+        ("my-finetune", "llama", 4),
+    ],
+)
+def test_tokens_are_estimated_for_the_model_family(model, family, expected):
+    backend, _ = _backend(_stream(b""), model, family=model_profile(model, family))
+    assert backend.estimate_tokens("177.8999") == expected
+
+
+# ---------- context window ----------
+
+
+def _monitor(kind: str, routes: dict[str, dict]) -> tuple[LocalServerMonitor, list[str]]:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        body = routes.get(request.url.path)
+        return httpx.Response(200, json=body) if body is not None else httpx.Response(404)
+
+    return LocalServerMonitor(BASE, server=kind, transport=httpx.MockTransport(handler)), calls
+
+
+def _models(*entries: dict) -> dict:
+    return {"object": "list", "data": [{"object": "model", **e} for e in entries]}
+
+
+@pytest.mark.parametrize(
+    ("kind", "model", "routes"),
+    [
+        ("ollama", "qwen3:14b", {
+            "/v1/models": _models({"id": "qwen3:14b"}),
+            "/api/ps": {"models": [{"name": "qwen3:14b", "model": "qwen3:14b", "context_length": 8192}]},
+        }),
+        ("ollama", "qwen3", {  # untagged: Ollama runs it as :latest
+            "/v1/models": _models({"id": "qwen3:latest"}),
+            "/api/ps": {"models": [{"name": "qwen3:latest", "model": "qwen3:latest", "context_length": 8192}]},
+        }),
+        ("llamacpp", "whatever.gguf", {
+            "/v1/models": _models({"id": "model.gguf"}),
+            "/props": {"default_generation_settings": {"n_ctx": 8192}},
+        }),
+        ("vllm", "Qwen/Qwen3-8B", {"/v1/models": _models({"id": "Qwen/Qwen3-8B", "max_model_len": 8192})}),
+        ("lmstudio", "qwen3-8b", {
+            "/v1/models": _models({"id": "qwen3-8b"}),
+            "/api/v0/models": {"data": [{"id": "qwen3-8b", "loaded_context_length": 8192}]},
+        }),
+    ],
+)
+async def test_the_budget_is_cut_to_the_window_the_server_reports(kind, model, routes, logs):
+    monitor, _ = _monitor(kind, routes)
+    backend, _ = _backend(_stream(b""), model, server=SERVERS[kind], context_tokens=24_000, monitor=monitor)
+
+    assert await backend.prompt_budget(2_000) == 6_192
+    assert await backend.prompt_budget(2_000) == 6_192
+    warnings = [line for line in logs if line.startswith("WARNING")]
+    assert len(warnings) == 1  # said once, not every turn
+    assert "8192-token window" in warnings[0] and SERVERS[kind].window_hint in warnings[0]
+
+
+async def test_a_window_too_small_for_the_reply_leaves_no_prompt_budget():
+    monitor, _ = _monitor("llamacpp", {"/v1/models": _models({"id": "m"}), "/props": {"default_generation_settings": {"n_ctx": 4096}}})
+    backend, _ = _backend(_stream(b""), "m", server=SERVERS["llamacpp"], monitor=monitor)
+    assert await backend.prompt_budget(16_000) == 0
+
+
+async def test_a_window_with_room_to_spare_keeps_the_configured_budget():
+    monitor, _ = _monitor("vllm", {"/v1/models": _models({"id": "m", "max_model_len": 131_072})})
+    backend, _ = _backend(_stream(b""), "m", server=SERVERS["vllm"], context_tokens=24_000, monitor=monitor)
+    assert await backend.prompt_budget(16_000) == 24_000
+
+
+async def test_a_model_not_loaded_yet_keeps_the_configured_budget():
+    # Ollama loads on first request; until then /api/ps does not list it.
+    monitor, _ = _monitor("ollama", {"/v1/models": _models({"id": "qwen3:14b"}), "/api/ps": {"models": []}})
+    backend, _ = _backend(_stream(b""), "qwen3:14b", server=SERVERS["ollama"], context_tokens=24_000, monitor=monitor)
+    assert await backend.prompt_budget(16_000) == 24_000
+
+
+async def test_a_server_that_reports_no_window_is_not_probed_for_one():
+    monitor, calls = _monitor("mlx", {"/v1/models": _models({"id": MODEL})})
+    backend, _ = _backend(_stream(b""), context_tokens=24_000, monitor=monitor)
+    assert await backend.prompt_budget(16_000) == 24_000
+    assert calls == []
 
 
 def test_client_has_a_placeholder_key_a_long_timeout_and_no_retries():
@@ -163,7 +333,7 @@ def _sync_client(handler) -> httpx.Client:
 
 def test_doctor_sees_the_server_and_its_models():
     listing = {"object": "list", "data": [{"id": MODEL, "object": "model"}]}
-    result = check_local_server(BASE, _sync_client(lambda r: httpx.Response(200, json=listing)))
+    result = check_local_server(TARGET, _sync_client(lambda r: httpx.Response(200, json=listing)))
     assert result.status is Status.OK
     assert MODEL in result.message
 
@@ -172,7 +342,7 @@ def test_doctor_reports_a_server_that_is_down():
     def refuse(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused", request=request)
 
-    result = check_local_server(BASE, _sync_client(refuse))
+    result = check_local_server(TARGET, _sync_client(refuse))
     assert result.status is Status.FAIL
     assert BASE in result.message and "./start --with-local-llm" in (result.fix or "")
 
@@ -209,3 +379,29 @@ def test_local_as_the_default_serves_every_task_its_one_model():
     config = _settings(LLM_PROVIDER="local", LLM_PROVIDER_SYNTHESIZER="openai")
     assert resolve_task("chat", config) == ("local", config.LOCAL_LLM_MODEL)
     assert resolve_task("synthesizer", config) == ("openai", config.LLM_SYNTHESIS_MODEL)
+
+
+def test_each_task_can_have_its_own_local_model():
+    from src.llm import resolve_task
+
+    config = _settings(LLM_PROVIDER="local", LOCAL_LLM_MODEL="qwen3:14b", LOCAL_LLM_MODEL_CHAT="qwen3:4b")
+    assert resolve_task("chat", config) == ("local", "qwen3:4b")
+    assert resolve_task("synthesizer", config) == ("local", "qwen3:14b")
+
+
+def test_a_local_model_override_is_ignored_off_the_local_provider():
+    from src.llm import resolve_task
+
+    config = _settings(LOCAL_LLM_MODEL_CHAT="qwen3:4b")
+    assert resolve_task("chat", config) == ("anthropic", config.LLM_CHAT_MODEL)
+
+
+def test_the_factory_wires_the_configured_server_and_family():
+    from src.llm import backend_for
+
+    config = _settings(
+        LLM_PROVIDER="local", LOCAL_LLM_SERVER="ollama", LOCAL_LLM_BASE_URL="http://localhost:11434/v1",
+        LOCAL_LLM_MODEL="my-finetune", LOCAL_LLM_MODEL_FAMILY="gemma", LOCAL_LLM_CONTEXT_BUDGET=8000,
+    )
+    backend = backend_for("chat", config)
+    assert (backend.server.kind, backend.family.family, backend.max_tokens_param) == ("ollama", "gemma", "max_tokens")

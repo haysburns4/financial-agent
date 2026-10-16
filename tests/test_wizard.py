@@ -210,8 +210,9 @@ def test_switching_to_local_asks_for_the_server_not_a_key(root):
             ("consumer key", ""),
             ("consumer secret", ""),
             ("provider", "local"),
-            ("MLX server URL", "<default>"),
-            ("Model the MLX server serves", "<default>"),
+            ("Local LLM server", "mlx"),
+            ("mlx_lm.server URL", "<default>"),
+            ("Model id", "<default>"),
             ("Watchlist", "<default>"),
         ]
     )
@@ -219,6 +220,7 @@ def test_switching_to_local_asks_for_the_server_not_a_key(root):
     run(root, io, network=network, ask_all=True)
 
     assert env(root).get("LLM_PROVIDER") == "local"
+    assert env(root).get("LOCAL_LLM_SERVER") == "mlx"
     assert env(root).get("LOCAL_LLM_BASE_URL") == "http://localhost:8080/v1"
     assert env(root).get("LOCAL_LLM_MODEL") == "mlx-community/Qwen3-14B-4bit"
     assert network.local_calls == ["http://localhost:8080/v1"]
@@ -262,7 +264,7 @@ def test_a_task_routed_elsewhere_gets_its_key_asked_for(root):
     # Chat on the local server, everything else on Anthropic.
     (root / ".env").write_text(COMPLETE + "LLM_PROVIDER_CHAT=local\n")
     network = FakeNetwork()
-    io = ScriptedPrompter([("MLX server URL", "<default>")])
+    io = ScriptedPrompter([("Local LLM server", "mlx"), ("mlx_lm.server URL", "<default>")])
 
     run(root, io, network=network)
 

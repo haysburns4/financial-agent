@@ -266,7 +266,7 @@ def test_doctor_checks_every_provider_a_task_uses(tmp_path):
     assert network.local_calls == ["http://localhost:8080/v1"]
 
 
-# ---------- local LLM (mlx_lm.server) ----------
+# ---------- local LLM ----------
 
 LOCAL_MODEL = "mlx-community/Qwen3-14B-4bit"
 
@@ -322,6 +322,7 @@ def test_model_given_as_a_local_directory_counts_as_downloaded(tmp_path):
 )
 def test_local_server_target_parses_the_base_url(url, host, port):
     target = local_server_target({"LOCAL_LLM_BASE_URL": url})
+
     assert target is not None and (target.host, target.port) == (host, port)
     assert target.model == LOCAL_MODEL
 
@@ -338,7 +339,6 @@ def test_local_llm_checks_only_run_when_a_task_uses_local(tmp_path):
 def test_local_llm_checks_when_everything_is_ready(tmp_path):
     _cache_model(tmp_path)
     system = FakeSystem(modules=("openai", "mlx_lm"), busy_ports=(8080,))
-
     results = _by_name(check_local_llm(_local_values(), {"HF_HUB_CACHE": str(tmp_path)}, system))
 
     assert {name: r.status for name, r in results.items()} == {
@@ -358,17 +358,54 @@ def test_local_llm_checks_warn_about_a_download_and_a_stopped_server(tmp_path):
 def test_local_llm_checks_skip_the_port_of_another_machine(tmp_path):
     values = _local_values(LOCAL_LLM_BASE_URL="http://gpu-box:8080/v1")
     results = _by_name(check_local_llm(values, {"HF_HUB_CACHE": str(tmp_path)}, FakeSystem()))
+
     assert results["local server port"].status is Status.OK
 
 
 def test_local_llm_checks_fail_on_an_unusable_base_url(tmp_path):
     values = _local_values(LOCAL_LLM_BASE_URL="localhost:8080")
     results = _by_name(check_local_llm(values, {"HF_HUB_CACHE": str(tmp_path)}, FakeSystem()))
+
     assert results["LOCAL_LLM_BASE_URL"].status is Status.FAIL
+
+
+def test_a_server_we_do_not_run_skips_the_mlx_checks_and_says_how_to_start_it(tmp_path):
+    values = _local_values(LOCAL_LLM_SERVER="ollama", LOCAL_LLM_BASE_URL="http://localhost:11434/v1", LOCAL_LLM_MODEL="qwen3:14b")
+    results = _by_name(check_local_llm(values, {"HF_HUB_CACHE": str(tmp_path)}, FakeSystem()))
+
+    assert set(results) == {"local server port"}
+    assert "`ollama serve`, then `ollama pull qwen3:14b`" in (results["local server port"].fix or "")
+
+
+def test_the_server_kind_reaches_the_network_check(tmp_path):
+    dotenv = COMPLETE.replace("LLM_PROVIDER=anthropic", "LLM_PROVIDER=local") + "LOCAL_LLM_SERVER=llamacpp\n"
+    network = FakeNetwork()
+    results = run_doctor(_install(tmp_path, dotenv), {}, FakeSystem(), network)
+
+    assert any(r.name == "local LLM server (llama.cpp server)" for r in results)
 
 
 def test_doctor_reports_the_local_llm_checks(tmp_path):
     dotenv = COMPLETE.replace("LLM_PROVIDER=anthropic", "LLM_PROVIDER=local")
     results = run_doctor(_install(tmp_path, dotenv), {"HF_HUB_CACHE": str(tmp_path / "hub")}, FakeSystem(), None)
+
     assert {"mlx-lm", "local model", "local server port"} <= {r.name for r in results}
     assert exit_code(results) == 0  # warnings only: the server is optional until used
+
+
+def test_each_task_model_is_checked_and_switching_between_them_is_flagged(tmp_path):
+    _cache_model(tmp_path)
+    values = _local_values(LOCAL_LLM_MODEL_CHAT="mlx-community/Qwen3-4B-4bit")
+    results = _by_name(check_local_llm(values, {"HF_HUB_CACHE": str(tmp_path)}, FakeSystem()))
+
+    assert results[f"local model {LOCAL_MODEL}"].status is Status.OK
+    assert results["local model mlx-community/Qwen3-4B-4bit"].status is Status.WARN  # not downloaded
+    assert results["local models"].status is Status.WARN and "reloads" in results["local models"].message
+
+
+def test_a_task_off_the_local_provider_does_not_count_its_local_model(tmp_path):
+    _cache_model(tmp_path)
+    values = _local_values(LLM_PROVIDER_CHAT="anthropic", LOCAL_LLM_MODEL_CHAT="mlx-community/Qwen3-4B-4bit")
+    results = _by_name(check_local_llm(values, {"HF_HUB_CACHE": str(tmp_path)}, FakeSystem()))
+
+    assert results["local model"].status is Status.OK and "local models" not in results

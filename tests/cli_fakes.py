@@ -3,7 +3,7 @@ from collections import deque
 from collections.abc import Sequence
 from pathlib import Path
 
-from src.cli.checks import CheckResult, Listener, Status, ok
+from src.cli.checks import CheckResult, Listener, LocalServerTarget, Status, ok
 
 # A .env the wizard and doctor have nothing to say about.
 ETRADE_KEY = "etrade-key-0000000000001234"
@@ -85,9 +85,9 @@ class FakeNetwork:
         self.etrade_calls.append((consumer_key, consumer_secret))
         return self._etrade.popleft() if self._etrade else ok("E-Trade keys", "accepted")
 
-    def local_server(self, base_url: str) -> CheckResult:
-        self.local_calls.append(base_url)
-        return ok("local MLX server", "serving mlx-community/Qwen3-14B-4bit")
+    def local_server(self, target: LocalServerTarget) -> CheckResult:
+        self.local_calls.append(target.base_url)
+        return ok(f"local LLM server ({target.server.label})", f"serving {target.model}")
 
 
 class FakeSystem:

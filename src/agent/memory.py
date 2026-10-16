@@ -14,7 +14,10 @@ Two tasks:
 WHICH archived narratives are eligible is decided by `select_outputs` alone —
 the seam a semantic retriever (and reranker) replaces. `build_context` decides
 how they are rendered and what fits.
+
+Fitting counts tokens with the caller's estimator (`LLMBackend.estimate_tokens`).
 """
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal
@@ -23,8 +26,7 @@ from sqlalchemy import Row, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from src.agent.tools import mask_account
-from src.config import Settings, settings
-from src.llm.factory import resolve_task
+from src.llm import estimate_tokens
 from src.models import AgentOutput, AgentOutputRef, PositionSnapshot
 
 MemoryTask = Literal["chat", "synthesis"]
@@ -35,8 +37,6 @@ _TITLES: dict[SectionLabel, str] = {
     "conversation": "Earlier in this conversation",
     "prior_narratives": "Prior briefings",
 }
-# The LLM task (src/llm/factory.py) whose provider sets each budget.
-_LLM_TASK = {"chat": "chat", "synthesis": "synthesizer"}
 _CONVERSATION_TURNS = 20
 _CHAT_NARRATIVES = 10
 _SYNTHESIS_NARRATIVES = 20
@@ -45,25 +45,6 @@ _CHAT_NARRATIVE_CHARS = 800
 # Chat shows portfolio totals on the latest snapshot date and this many earlier.
 _CHAT_HISTORY_POINTS = 4
 _TRIMMED = " …[trimmed]"
-
-
-def estimate_tokens(text: str) -> int:
-    """APPROXIMATION: a token per digit and per punctuation mark, about four
-    characters per token for the rest. Qwen's tokenizer splits numbers digit by
-    digit, so plain characters/4 undercounted tool JSON about threefold; this
-    runs 5-25% over Qwen3's real count on both JSON and prose.
-    TODO: this shouldn't be solely for Qwen — make local models swappable."""
-    digits = sum(c.isdigit() for c in text)
-    marks = sum(not c.isalnum() and not c.isspace() for c in text)
-    return digits + marks + (len(text) - digits - marks) // 4
-
-
-def context_budget(task: MemoryTask, config: Settings = settings) -> int:
-    """Prompt-input tokens for `task`, by the provider it routes to: a local
-    model's window is far smaller than a hosted one's. Output tokens
-    (max_tokens) come on top."""
-    provider, _ = resolve_task(_LLM_TASK[task], config)
-    return config.LOCAL_LLM_CONTEXT_BUDGET if provider == "local" else config.LLM_CONTEXT_BUDGET
 
 
 @dataclass
@@ -154,12 +135,14 @@ async def build_context(
     *,
     account_id: str | None = None,
     skip_recent_turns: int = 0,
+    count: Callable[[str], int] = estimate_tokens,
 ) -> AssembledContext:
     """Background for a `task` prompt, at most `budget_tokens` (estimated).
 
     `account_id` narrows chat's portfolio totals to the highlighted account.
     `skip_recent_turns` leaves out the newest turns of the conversation, which
-    the caller already sends as messages.
+    the caller already sends as messages. `count` is the model's token
+    estimator; the default errs high for an unknown tokenizer.
     """
     if task == "chat":
         narratives = await select_outputs(engine, task, None, lookback_days, _CHAT_NARRATIVES)
@@ -180,13 +163,13 @@ async def build_context(
                 _Candidate("portfolio", await _portfolio_detail(conn, scope_tickers or [])),
                 _Candidate("prior_narratives", await _narratives(conn, narratives, None)),
             ]
-    return _pack(candidates, budget_tokens)
+    return _pack(candidates, budget_tokens, count)
 
 
 # ---------- packing ----------
 
 
-def _pack(candidates: list[_Candidate], budget: int) -> AssembledContext:
+def _pack(candidates: list[_Candidate], budget: int, count: Callable[[str], int]) -> AssembledContext:
     """Fill sections in priority order, item by item, while the whole rendering
     fits. An item too big for what is left is trimmed if it is a section's
     first; otherwise the section stops there."""
@@ -196,41 +179,43 @@ def _pack(candidates: list[_Candidate], budget: int) -> AssembledContext:
     for candidate in candidates:
         chosen: list[_Item] = []
         for item in candidate.items:
-            if _fits(sections, candidate, [*chosen, item], budget):
+            if _fits(sections, candidate, [*chosen, item], budget, count):
                 chosen.append(item)
                 continue
-            if not chosen and (trimmed := _trim_to_fit(sections, candidate, item, budget)):
+            if not chosen and (trimmed := _trim_to_fit(sections, candidate, item, budget, count)):
                 chosen.append(trimmed)
             break
         if len(chosen) < len(candidate.items) or any(i.text.endswith(_TRIMMED) for i in chosen):
             truncated.append(candidate.label)
         if chosen:
-            sections.append(_section(candidate, chosen))
+            sections.append(_section(candidate, chosen, count))
             output_ids.extend(i.output_id for i in chosen if i.output_id is not None)
-    return AssembledContext(sections, estimate_tokens(_render(sections)), budget, truncated, output_ids)
+    return AssembledContext(sections, count(_render(sections)), budget, truncated, output_ids)
 
 
-def _section(candidate: _Candidate, items: list[_Item]) -> ContextSection:
+def _section(candidate: _Candidate, items: list[_Item], count: Callable[[str], int]) -> ContextSection:
     ordered = list(reversed(items)) if candidate.chronological else items
     content = "\n\n".join(i.text for i in ordered)
     return ContextSection(
-        candidate.label, content, estimate_tokens(_render([ContextSection(candidate.label, content, 0)]))
+        candidate.label, content, count(_render([ContextSection(candidate.label, content, 0)]))
     )
 
 
-def _fits(sections: list[ContextSection], candidate: _Candidate, items: list[_Item], budget: int) -> bool:
-    return estimate_tokens(_render([*sections, _section(candidate, items)])) <= budget
+def _fits(
+    sections: list[ContextSection], candidate: _Candidate, items: list[_Item], budget: int, count: Callable[[str], int]
+) -> bool:
+    return count(_render([*sections, _section(candidate, items, count)])) <= budget
 
 
 def _trim_to_fit(
-    sections: list[ContextSection], candidate: _Candidate, item: _Item, budget: int
+    sections: list[ContextSection], candidate: _Candidate, item: _Item, budget: int, count: Callable[[str], int]
 ) -> _Item | None:
     """`item` cut to the longest prefix that fits, or None if not even a line does."""
     low, high, best = 0, len(item.text), None
     while low <= high:
         mid = (low + high) // 2
         trial = _Item(item.text[:mid].rstrip() + _TRIMMED, item.output_id)
-        if _fits(sections, candidate, [trial], budget):
+        if _fits(sections, candidate, [trial], budget, count):
             best, low = trial, mid + 1
         else:
             high = mid - 1

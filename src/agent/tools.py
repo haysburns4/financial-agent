@@ -368,9 +368,9 @@ def _ticker(value: Any) -> str | None:  # anti-slop: allow no-any-parameters - t
 
 
 def _rounded(value: object) -> object:
-    """`value` with floats cut to two decimals, or four below 1. The model
-    reads every digit as a token, and float noise (177.89990234375) was most of
-    a price-history payload."""
+    """`value` with floats cut to two decimals, or four below 1. Every model
+    pays tokens for digits (some tokenizers one per digit), and float noise
+    (177.89990234375) was most of a price-history payload."""
     if isinstance(value, float):
         return round(value, 2) if abs(value) >= 1 else round(value, 4)
     if isinstance(value, dict):

@@ -33,7 +33,9 @@ from src.llm import (
     ToolCall,
     ToolCallDelta,
     Usage,
+    estimate_tokens,
 )
+from src.llm.base import HOSTED_CONTEXT_TOKENS
 from src.models import Base
 
 
@@ -55,6 +57,12 @@ class FakeBackend:
     @property
     def model(self) -> str:
         return self._model
+
+    def estimate_tokens(self, text: str) -> int:
+        return estimate_tokens(text)
+
+    async def prompt_budget(self, max_tokens: int) -> int:
+        return HOSTED_CONTEXT_TOKENS
 
     async def stream(
         self,

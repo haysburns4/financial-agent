@@ -28,6 +28,7 @@ from src.cli.spec import (
     providers_in_use,
 )
 from src.cli.ui import Prompter
+from src.llm.local_profiles import SERVER_KINDS, SERVERS, server_profile
 
 SANDBOX = "Sandbox: E-Trade's test environment with fake data"
 REAL = "Real account: your actual brokerage data (production keys)"
@@ -41,6 +42,7 @@ FLOW = (
     "LLM_PROVIDER",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "LOCAL_LLM_SERVER",
     "LOCAL_LLM_BASE_URL",
     "LOCAL_LLM_MODEL",
     "LLM_CHAT_MODEL",
@@ -229,24 +231,33 @@ class Wizard:
         self._credentials([(name, f"{provider} API key")], check)
 
     def _local_server(self) -> None:
-        """The local provider has no key: ask where the MLX server is, then
-        check it answers. A server that is down is reported, not re-asked —
-        the URL is usually right and the server just isn't started yet."""
+        """The local provider has no key: ask which server runs the model and
+        where, then check it answers. A server that is down is reported, not re-asked."""
+        kind = self.env.get("LOCAL_LLM_SERVER") or BY_NAME["LOCAL_LLM_SERVER"].default or ""
+        if self._needs("LOCAL_LLM_SERVER"):
+            current = server_profile(kind).kind
+            kind = self.io.select("Local LLM server", SERVER_KINDS, current)
+            self._set("LOCAL_LLM_SERVER", kind)
+        server = server_profile(kind)
+
         name = "LOCAL_LLM_BASE_URL"
         url = self.env.get(name) or BY_NAME[name].default or ""
-        if self._needs(name):
-            url = self._ask_text(name, "MLX server URL (OpenAI-compatible, from mlx_lm.server)", url)
+        if url in {s.default_base_url for s in SERVERS.values()}:
+            url = server.default_base_url  # another server's default is not a choice the user made
+        if self._needs(name) or url != self.env.get(name):
+            url = self._ask_text(name, f"{server.label} URL (OpenAI-compatible, ending in /v1)", url)
             self._set(name, url)
-        if self.network is not None:
-            self.io.results([self.network.local_server(url)])
+        target = checks.local_server_target(self._values())
+        if self.network is not None and target is not None:
+            self.io.results([self.network.local_server(target)])
 
     def _models(self, provider: str, provider_changed: bool) -> None:
         if provider == "local":
-            # The server serves one model, for every task routed to it.
+            # One model for every task routed to it.
             name = "LOCAL_LLM_MODEL"
             if provider_changed or self._needs(name):
                 current = self.env.get(name) or BY_NAME[name].default or ""
-                self._set(name, self._ask_text(name, "Model the MLX server serves", current))
+                self._set(name, self._ask_text(name, "Model id, as the server names it", current))
             return
         names = ("LLM_CHAT_MODEL", "LLM_SYNTHESIS_MODEL")
         if not (provider_changed or any(self._needs(name) for name in names)):

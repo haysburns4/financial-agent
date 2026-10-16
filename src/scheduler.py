@@ -52,6 +52,8 @@ signal_engine = SignalEngine(engine)
 # Each task asks for its own backend; provider routing lives in src/llm/factory.py.
 signal_synthesizer = SignalSynthesizer(backend_for("synthesizer"), engine)
 agent_chat = AgentChat(engine, backend_for("chat"))
+# Each LLM task's output cap.
+LLM_REPLY_TOKENS = {"chat": AgentChat.MAX_TOKENS, "synthesizer": SignalSynthesizer.MAX_TOKENS}
 
 
 async def _price_then_signals() -> None:

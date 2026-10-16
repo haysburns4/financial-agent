@@ -11,7 +11,7 @@ from src.db import engine, get_connection, init_db
 from src.etrade.auth import auth
 from src.llm import health as llm_health
 from src.portfolio_history import history_summary
-from src.scheduler import build_scheduler, portfolio_history_pipeline
+from src.scheduler import LLM_REPLY_TOKENS, build_scheduler, portfolio_history_pipeline
 from src.server import create_app
 
 
@@ -46,7 +46,7 @@ async def lifespan(app):
     app.state.scheduler = scheduler
 
     # A local LLM that is down is reported here, not when a chat request hangs.
-    llm_summary = await llm_health.log_startup(llm_health.MONITOR)
+    llm_summary = await llm_health.log_startup(llm_health.MONITOR, reply_tokens=LLM_REPLY_TOKENS)
     logger.info(
         "Ready: E-Trade {}; {}; {}",
         "tokens loaded" if etrade_ready else "needs OAuth",

@@ -11,7 +11,8 @@ from sqlalchemy.pool import StaticPool
 
 from src.agent.archive import content_hash, record_output, refs_from_context
 from src.agent.chat import AgentChat, conversation_key
-from src.agent.memory import build_context, context_budget, estimate_tokens
+from src.agent.memory import build_context
+from src.llm import backend_for, estimate_tokens
 from src.agent.synthesizer import SignalSynthesizer
 from src.config import settings
 from src.models import AgentOutput, AgentOutputRef, PositionSnapshot
@@ -244,12 +245,13 @@ async def test_a_synthesis_sees_and_records_the_briefings_before_it(engine):
         ({"LLM_PROVIDER": "anthropic", "LLM_PROVIDER_SYNTHESIZER": "local"}, 120_000, 24_000),
     ],
 )
-def test_the_budget_follows_the_provider_each_task_routes_to(overrides, chat, synthesis):
+async def test_the_budget_follows_the_provider_each_task_routes_to(overrides, chat, synthesis):
     config = settings.model_copy(update={
-        "LLM_PROVIDER_CHAT": None, "LLM_PROVIDER_SYNTHESIZER": None,
+        "LLM_PROVIDER_CHAT": None, "LLM_PROVIDER_SYNTHESIZER": None, "ANTHROPIC_API_KEY": "k",
         "LLM_CONTEXT_BUDGET": 120_000, "LOCAL_LLM_CONTEXT_BUDGET": 24_000, **overrides,
     })
-    assert (context_budget("chat", config), context_budget("synthesis", config)) == (chat, synthesis)
+    budgets = [await backend_for(task, config).prompt_budget(1000) for task in ("chat", "synthesizer")]
+    assert budgets == [chat, synthesis]
 
 
 # ---------- endpoints ----------
@@ -339,7 +341,8 @@ async def test_archive_summary_counts_for_health(engine):
 
 
 def test_estimate_tokens_counts_each_digit_and_mark():
-    # Qwen splits numbers digit by digit; at four characters a token, price
-    # JSON was undercounted about threefold.
+    # By default every digit is a token, as for the tokenizers that split
+    # numbers; at four characters a token, price JSON was undercounted threefold.
     assert estimate_tokens("abcdefgh") == 2
     assert estimate_tokens("177.8999") == 8
+    assert estimate_tokens("177.8999", digits_per_token=3) == 4  # tokenizers that group digits

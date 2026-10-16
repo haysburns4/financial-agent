@@ -116,6 +116,14 @@ def test_a_remote_base_url_is_not_started_here(tmp_path):
     assert any("not this machine" in line for line in io.output)
 
 
+def test_a_server_we_do_not_run_is_left_to_the_user(tmp_path):
+    launcher, io = _launcher(tmp_path, FakeSystem(modules=()))
+
+    values = {"LLM_PROVIDER": "local", "LOCAL_LLM_SERVER": "vllm", "LOCAL_LLM_BASE_URL": "http://localhost:8001/v1"}
+    assert launcher._start_local_llm(values)  # not a failure: the app can still start
+    assert any("`vllm serve" in line and "--port 8001" in line for line in io.output)
+
+
 def test_missing_mlx_lm_stops_the_launch(tmp_path):
     launcher, io = _launcher(tmp_path, FakeSystem(modules=()))
 

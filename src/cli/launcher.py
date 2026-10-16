@@ -26,6 +26,7 @@ from src.cli.supervisor import Child, ProcessSpec, Supervisor
 from src.cli.spec import BY_NAME, OPENAI_SDK_PROVIDERS, providers_in_use
 from src.cli.ui import Prompter
 from src.cli.wizard import Wizard
+from src.llm.local_profiles import start_hint
 
 API_SERVICE = "financial-agent"
 WEB_SERVICE = "financial-agent-web"
@@ -46,7 +47,7 @@ class Options:
     open_browser: bool = True
     # A Yahoo period ("1mo", "5y") of daily bars to refresh at startup; None skips.
     backfill: str | None = None
-    # Also run mlx_lm.server for LLM_PROVIDER=local; off by default.
+    # Also run the local LLM server for LLM_PROVIDER=local; off by default.
     local_llm: bool = False
 
 
@@ -345,6 +346,12 @@ class Launcher:
         if target is None:
             self.io.info("LOCAL_LLM_BASE_URL is not an http(s) URL; fix it with `./start setup`.")
             return False
+        if not target.server.launchable:
+            self.io.info(
+                f"LOCAL_LLM_SERVER={target.server.kind}: ./start runs only mlx_lm.server; "
+                f"{start_hint(target.server, target.base_url, target.model)}."
+            )
+            return True
         if "local" not in providers_in_use(values):
             self.io.info("Note: no LLM task uses the local provider (set LLM_PROVIDER=local); starting the MLX server anyway.")
         if not target.on_this_machine:

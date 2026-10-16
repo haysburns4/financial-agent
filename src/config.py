@@ -23,9 +23,16 @@ class Settings(BaseSettings):
     LLM_SYNTHESIS_MODEL: str = "claude-sonnet-5"
     ANTHROPIC_API_KEY: str | None = None
     OPENAI_API_KEY: str | None = None
-    # LLM_PROVIDER=local: an OpenAI-compatible MLX server (mlx_lm.server).
+    # LLM_PROVIDER=local: any OpenAI-compatible server.
+    LOCAL_LLM_SERVER: str = "mlx"  # mlx | ollama | llamacpp | lmstudio | vllm | openai_compat
     LOCAL_LLM_BASE_URL: str = "http://localhost:8080/v1"
     LOCAL_LLM_MODEL: str = "mlx-community/Qwen3-14B-4bit"
+    # Per-task models on the same server; unset means LOCAL_LLM_MODEL.
+    LOCAL_LLM_MODEL_CHAT: str | None = None
+    LOCAL_LLM_MODEL_SYNTHESIZER: str | None = None
+    # Unset matches the family from the model id; set it for a model the
+    # patterns do not recognise.
+    LOCAL_LLM_MODEL_FAMILY: str | None = None
     LOCAL_LLM_TIMEOUT_SECONDS: int = 180
     LLM_CONTEXT_BUDGET: int = 120_000
     LOCAL_LLM_CONTEXT_BUDGET: int = 24_000
