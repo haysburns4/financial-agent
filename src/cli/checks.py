@@ -22,12 +22,12 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 import httpx
-import pyetrade
 import requests
 from requests_oauthlib.oauth1_session import TokenRequestDenied
 
 from src.cli.env_file import EnvFile
 from src.cli.spec import BY_NAME, OPENAI_SDK_PROVIDERS, PROVIDER_KEYS, SPEC, local_models, problem, providers_in_use
+from src.etrade import ETradeOAuth
 from src.etrade.errors import denied
 from src.llm.local_profiles import SERVERS, ServerProfile, server_profile, start_hint
 
@@ -129,7 +129,7 @@ _ETRADE_PROBLEMS: Mapping[str, tuple[str, str]] = {
 def check_etrade_keys(
     consumer_key: str,
     consumer_secret: str,
-    oauth_factory: Callable[[str, str], pyetrade.ETradeOAuth] = pyetrade.ETradeOAuth,
+    oauth_factory: Callable[[str, str], ETradeOAuth] = ETradeOAuth,
     timeout: float = NETWORK_TIMEOUT,
 ) -> CheckResult:
     """Ask E-Trade for a request token, which only needs the consumer key pair."""

@@ -6,7 +6,7 @@ tokens are encrypted and written to the local SQLite DB. On process restart,
 `load_persisted()` decrypts and rehydrates the singleton so the user doesn't
 have to re-authenticate.
 
-Tokens are opportunistically renewed via `pyetrade.ETradeAccessManager` once
+Tokens are opportunistically renewed via `ETradeAccessManager` once
 they cross `RENEW_THRESHOLD_MIN` minutes of age — just under E-Trade's 2-hour
 idle TTL. Renewal failure (typically the midnight-ET daily invalidation)
 clears the tokens and forces re-auth.
@@ -18,12 +18,12 @@ import asyncio
 from collections.abc import Callable
 from datetime import datetime, timezone
 
-import pyetrade
 from loguru import logger
 from requests_oauthlib.oauth1_session import TokenRequestDenied
 
 from src.config import settings
-from src.etrade import token_store
+from src.etrade import ETradeAccessManager, ETradeAccounts, ETradeMarket, ETradeOAuth, token_store
+from src.etrade.client import read_only
 from src.etrade.errors import ETradeAuthError, denied  # ETradeAuthError re-exported for callers
 from src.etrade.token_store import ETradeTokens  # re-exported for callers
 
@@ -33,11 +33,11 @@ class ETradeAuth:
 
     def __init__(
         self,
-        oauth_factory: Callable[[str, str], pyetrade.ETradeOAuth] = pyetrade.ETradeOAuth,
+        oauth_factory: Callable[[str, str], ETradeOAuth] = ETradeOAuth,
     ) -> None:
         # Injected so tests can supply a stand-in without patching an import path.
         self._oauth_factory = oauth_factory
-        self._oauth: pyetrade.ETradeOAuth | None = None
+        self._oauth: ETradeOAuth | None = None
         self._tokens: ETradeTokens | None = None
 
     # ---------- OAuth flow ----------
@@ -85,25 +85,26 @@ class ETradeAuth:
         age = datetime.now(timezone.utc) - self._tokens.authenticated_at
         return int(age.total_seconds() // 60)
 
-    async def get_market_session(self) -> pyetrade.ETradeMarket:
-        tokens = await self._require_fresh_tokens()
-        return pyetrade.ETradeMarket(
-            settings.ETRADE_CONSUMER_KEY,
-            settings.ETRADE_CONSUMER_SECRET,
-            tokens.oauth_token,
-            tokens.oauth_token_secret,
-            dev=settings.ETRADE_SANDBOX,
-        )
 
-    async def get_accounts_session(self) -> pyetrade.ETradeAccounts:
+    async def get_market_session(self) -> ETradeMarket:
         tokens = await self._require_fresh_tokens()
-        return pyetrade.ETradeAccounts(
+        return read_only(ETradeMarket(
             settings.ETRADE_CONSUMER_KEY,
             settings.ETRADE_CONSUMER_SECRET,
             tokens.oauth_token,
             tokens.oauth_token_secret,
             dev=settings.ETRADE_SANDBOX,
-        )
+        ))
+
+    async def get_accounts_session(self) -> ETradeAccounts:
+        tokens = await self._require_fresh_tokens()
+        return read_only(ETradeAccounts(
+            settings.ETRADE_CONSUMER_KEY,
+            settings.ETRADE_CONSUMER_SECRET,
+            tokens.oauth_token,
+            tokens.oauth_token_secret,
+            dev=settings.ETRADE_SANDBOX,
+        ))
 
     async def _require_fresh_tokens(self) -> ETradeTokens:
         if self._tokens is None:
@@ -119,12 +120,12 @@ class ETradeAuth:
     async def _maybe_renew(self) -> bool:
         if self._tokens is None:
             return False
-        manager = pyetrade.ETradeAccessManager(
+        manager = read_only(ETradeAccessManager(
             settings.ETRADE_CONSUMER_KEY,
             settings.ETRADE_CONSUMER_SECRET,
             self._tokens.oauth_token,
             self._tokens.oauth_token_secret,
-        )
+        ))
         try:
             ok = await asyncio.to_thread(manager.renew_access_token)
         except Exception as exc:

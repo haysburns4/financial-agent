@@ -9,6 +9,7 @@ from src.backtest import persistence as backtest_persistence
 from src.config import settings
 from src.db import engine, get_connection, init_db
 from src.etrade.auth import auth
+from src.etrade.client import order_endpoints_blocked
 from src.llm import health as llm_health
 from src.portfolio_history import history_summary
 from src.scheduler import LLM_REPLY_TOKENS, build_scheduler, portfolio_history_pipeline
@@ -47,6 +48,10 @@ async def lifespan(app):
 
     # A local LLM that is down is reported here, not when a chat request hangs.
     llm_summary = await llm_health.log_startup(llm_health.MONITOR, reply_tokens=LLM_REPLY_TOKENS)
+    if order_endpoints_blocked():
+        logger.info("E-Trade read-only: order place/preview/change/cancel requests are blocked")
+    else:
+        logger.critical("E-Trade read-only guard is not blocking every order-write path; see src/etrade/client.py")
     logger.info(
         "Ready: E-Trade {}; {}; {}",
         "tokens loaded" if etrade_ready else "needs OAuth",

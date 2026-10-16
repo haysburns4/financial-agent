@@ -18,6 +18,7 @@ from src.backtest.runner import BacktestRunner
 from src.config import settings
 from src.db import engine, get_connection, health_check
 from src.etrade.auth import ETradeAuthError, auth
+from src.etrade.client import order_endpoints_blocked
 from src.llm import health as llm_health
 from src.models import Indicator, PipelineRun, Position, PriceBar, Signal
 from src.pipelines import monitored_tickers
@@ -109,6 +110,13 @@ def create_app() -> FastAPI:
             "status": "ok" if ok and not alerts else "degraded",
             "db": ok,
             "llm": llm,
+            "etrade": {
+                "authenticated": await auth.is_authenticated(),
+                "sandbox": settings.ETRADE_SANDBOX,
+                "session_age_minutes": auth.session_age_minutes(),
+                "mode": "read_only",
+                "order_endpoints_blocked": order_endpoints_blocked(),
+            },
             "alerts": alerts,
             "portfolio_history": history,
             "agent_archive": archive,

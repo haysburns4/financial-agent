@@ -128,6 +128,7 @@ async def test_health_endpoint_is_degraded_not_failed_when_the_server_is_down(mo
     body = response.json()
     assert response.status_code == 200
     assert body["status"] == "degraded" and body["db"] is True
+    assert body["etrade"]["mode"] == "read_only" and body["etrade"]["order_endpoints_blocked"] is True
     assert body["llm"]["local"]["reachable"] is False
     assert body["alerts"] and BASE in body["alerts"][0]
 

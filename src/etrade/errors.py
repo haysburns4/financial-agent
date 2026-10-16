@@ -25,3 +25,13 @@ def denied(exc: TokenRequestDenied, stage: str) -> ETradeAuthError:
         f"E-Trade rejected the {stage} request: {problem or str(exc)[:200]}",
         problem,
     )
+
+
+class ReadOnlyViolationError(Exception):
+    """A request to an E-Trade order-writing endpoint was stopped before it
+    was sent. Never expected in normal operation: it means something
+    regressed (see src/etrade/client.py)."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(f"blocked E-Trade order-write request to {path}: this app is read-only")
+        self.path = path
