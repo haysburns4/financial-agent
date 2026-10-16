@@ -17,6 +17,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 
 from src.cli.env_file import quote, write_atomic
+from src.llm.local_profiles import DEFAULT_SERVER, MODEL_FAMILIES, SERVER_KINDS
 
 EXAMPLE_PATH = Path(__file__).resolve().parents[2] / ".env.example"
 
@@ -106,7 +107,12 @@ PROVIDER_MODELS: Mapping[str, tuple[str, str]] = {
 # The tasks' provider overrides; unset means LLM_PROVIDER. Mirrors
 # resolve_task() in src/llm/factory.py, which src/cli cannot import.
 TASK_PROVIDER_SETTINGS = ("LLM_PROVIDER_CHAT", "LLM_PROVIDER_SYNTHESIZER")
-# Providers that need the openai package: OpenAI itself, and the local MLX
+# Each task's local model override, by its provider override.
+TASK_LOCAL_MODEL_SETTINGS: Mapping[str, str] = {
+    "LLM_PROVIDER_CHAT": "LOCAL_LLM_MODEL_CHAT",
+    "LLM_PROVIDER_SYNTHESIZER": "LOCAL_LLM_MODEL_SYNTHESIZER",
+}
+# Providers that need the openai package: OpenAI itself, and the local
 # server, which speaks its API.
 OPENAI_SDK_PROVIDERS = ("openai", "local")
 PROVIDER_KEYS: Mapping[str, str] = {
@@ -133,7 +139,9 @@ SPEC: tuple[SettingSpec, ...] = (
         Boolean(),
     ),
     SettingSpec(
-        "LLM_PROVIDER", "anthropic", False, "LLM provider: anthropic | openai | local (an MLX server).", Choice(PROVIDERS)
+        "LLM_PROVIDER", "anthropic", False,
+        "LLM provider: anthropic | openai | local (an OpenAI-compatible server: MLX, Ollama, llama.cpp, ...).",
+        Choice(PROVIDERS),
     ),
     SettingSpec("LLM_CHAT_MODEL", "claude-opus-5", False, "Model for the chat agent.", Text()),
     SettingSpec(
@@ -149,12 +157,31 @@ SPEC: tuple[SettingSpec, ...] = (
         "OpenAI API key (also: uv sync --extra openai).", Credential(), WhenProviderUsed("openai"),
     ),
     SettingSpec(
+        "LOCAL_LLM_SERVER", DEFAULT_SERVER, False,
+        "Provider local: which OpenAI-compatible server runs the model.",
+        Choice(SERVER_KINDS),
+    ),
+    SettingSpec(
         "LOCAL_LLM_BASE_URL", "http://localhost:8080/v1", False,
-        "Provider local: the MLX server's OpenAI-compatible endpoint (mlx_lm.server).", Text(),
+        "Provider local: the server's OpenAI-compatible endpoint, ending in /v1.", Text(),
     ),
     SettingSpec(
         "LOCAL_LLM_MODEL", "mlx-community/Qwen3-14B-4bit", False,
-        "Provider local: the model the MLX server serves, used by every task routed to it.", Text(),
+        "Provider local: the model id the server knows (a Hugging Face repo, an Ollama tag), for every task routed to it.",
+        Text(),
+    ),
+    SettingSpec(
+        "LOCAL_LLM_MODEL_CHAT", None, False,
+        "Provider local: a different model for the chat agent; blank uses LOCAL_LLM_MODEL.", Text(),
+    ),
+    SettingSpec(
+        "LOCAL_LLM_MODEL_SYNTHESIZER", None, False,
+        "Provider local: a different model for the signal synthesizer; blank uses LOCAL_LLM_MODEL.", Text(),
+    ),
+    SettingSpec(
+        "LOCAL_LLM_MODEL_FAMILY", None, False,
+        "Provider local: the model family, for thinking and token counting; blank matches it from the model id.",
+        Choice(MODEL_FAMILIES),
     ),
     SettingSpec(
         "LOCAL_LLM_TIMEOUT_SECONDS", "180", False,
@@ -168,7 +195,7 @@ SPEC: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         "LOCAL_LLM_CONTEXT_BUDGET", "24000", False,
-        "Provider local: prompt tokens per request; keep it plus the reply under the model's context window.",
+        "Provider local: prompt tokens per request; cut to fit the context window the server reports.",
         Integer(1000, 2_000_000),
     ),
     SettingSpec(
@@ -235,6 +262,20 @@ def providers_in_use(values: Mapping[str, str]) -> set[str]:
     """Every provider some LLM task runs on: each task's override, else LLM_PROVIDER."""
     base = (values.get("LLM_PROVIDER") or BY_NAME["LLM_PROVIDER"].default or "").strip().lower()
     return {(values.get(name) or base).strip().lower() for name in TASK_PROVIDER_SETTINGS}
+
+
+def local_models(values: Mapping[str, str]) -> list[str]:
+    """The distinct models the tasks on the local provider use, in task order."""
+    base = (values.get("LLM_PROVIDER") or BY_NAME["LLM_PROVIDER"].default or "").strip().lower()
+    shared = values.get("LOCAL_LLM_MODEL") or BY_NAME["LOCAL_LLM_MODEL"].default or ""
+    models: list[str] = []
+    for provider_setting in TASK_PROVIDER_SETTINGS:
+        if (values.get(provider_setting) or base).strip().lower() != "local":
+            continue
+        model = values.get(TASK_LOCAL_MODEL_SETTINGS[provider_setting]) or shared
+        if model not in models:
+            models.append(model)
+    return models
 
 
 def problem(spec: SettingSpec, values: Mapping[str, str]) -> str | None:

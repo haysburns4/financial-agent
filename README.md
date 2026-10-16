@@ -12,7 +12,7 @@ Automated market data collection, technical signal generation, and portfolio mon
 - **Data source:** E-Trade API via `pyetrade` (OAuth 1.0a)
 - **Scheduler:** APScheduler 3.x
 - **Indicators:** pandas-ta
-- **LLM:** provider-neutral layer (`src/llm/`); Anthropic, OpenAI, or a local MLX server (`LLM_PROVIDER=local`)
+- **LLM:** provider-neutral layer (`src/llm/`); Anthropic, OpenAI, or a local OpenAI-compatible server — MLX, Ollama, llama.cpp, LM Studio, vLLM (`LLM_PROVIDER=local`)
 - **Web UI:** Next.js 16 + CopilotKit v2 (`web/`), talking to the API over AG-UI
 
 ## Getting started
@@ -30,17 +30,18 @@ and the web UI, walks you through the E-Trade login and opens the dashboard at
 http://127.0.0.1:3000. Ctrl-C stops everything. Later runs skip whatever is already done.
 
 ```
-./start --dev          # web UI with hot reload (`next dev`) instead of a production build
-./start --no-browser   # don't open the dashboard
-./start --backfill     # refresh prices, recalibrate, catch up on missed signals (`--backfill 5y` the first time)
-./start --with-local-llm  # also run mlx_lm.server for LLM_PROVIDER=local
-./start login          # log in to E-Trade again, against the running app
-./start setup --all    # change settings (writes .env)
-./start doctor         # check keys, Node, ports, and shell variables that override .env
+./start --dev             # web UI with hot reload (`next dev`) instead of a production build
+./start --no-browser      # don't open the dashboard
+./start --backfill        # refresh prices, recalibrate, catch up on missed signals (`--backfill 5y` the first time)
+./start --with-local-llm  # also run mlx_lm.server for LLM_PROVIDER=local (LOCAL_LLM_SERVER=mlx)
+./start login             # log in to E-Trade again, against the running app
+./start setup --all       # change settings (writes .env)
+./start doctor            # check keys, Node, ports, and shell variables that override .env
 ```
 
 Both servers listen on 127.0.0.1. Settings live in `.env`; `.env.example` lists every one with its default. Variables exported in your shell override `.env`.
 
+<!--
 ### Running without the launcher
 
 1. `uv sync --extra dev` (add `--extra openai` for `LLM_PROVIDER=openai`).
@@ -55,6 +56,14 @@ Both servers listen on 127.0.0.1. Settings live in `.env`; `.env.example` lists 
    ```
    curl -X POST 127.0.0.1:8000/auth/complete -H 'Content-Type: application/json' -d '{"verifier":"XXXX"}'
    ```
+
+-->
+
+### Local LLM
+
+`LLM_PROVIDER=local` runs the agent on a model served on your machine or LAN:
+MLX, Ollama, llama.cpp, LM Studio, vLLM, or any OpenAI-compatible server. See
+[docs/local_llm_serving.md](docs/local_llm_serving.md).
 
 ### Tests and lint
 

@@ -160,6 +160,34 @@ class LLMBackend(Protocol):
         """
         ...
 
+    def estimate_tokens(self, text: str) -> int:
+        """`text`'s length in this model's tokens, erring high."""
+        ...
+
+    async def prompt_budget(self, max_tokens: int) -> int:
+        """Prompt-input tokens a request may use when the reply may take up
+        to `max_tokens`. Never raises."""
+        ...
+
+
+# Prompt tokens per request for hosted models when the factory is not told
+# otherwise. Their windows are far larger, so this is a cost ceiling.
+HOSTED_CONTEXT_TOKENS = 120_000
+# Tokenizers that split numbers into single digits (Qwen, Gemma, Mistral)
+# need 1; tiktoken-style ones that group up to three (GPT, Llama 3) need 3.
+DIGITS_PER_TOKEN_SPLIT = 1
+DIGITS_PER_TOKEN_GROUPED = 3
+
+
+def estimate_tokens(text: str, digits_per_token: int = DIGITS_PER_TOKEN_SPLIT) -> int:
+    """APPROXIMATION: a token per punctuation mark, one per `digits_per_token`
+    digits, and about four characters per token for the rest. Plain
+    characters/4 undercounts tool JSON, which is mostly digits and marks, by
+    up to threefold."""
+    digits = sum(c.isdigit() for c in text)
+    marks = sum(not c.isalnum() and not c.isspace() for c in text)
+    return -(-digits // digits_per_token) + marks + (len(text) - digits - marks) // 4
+
 
 async def collect(stream: AsyncIterator[Delta]) -> LLMResponse:
     """Drain a stream into its finished response."""

@@ -10,6 +10,7 @@ import anthropic
 from anthropic.lib.streaming import ParsedMessageStreamEvent
 
 from src.llm.base import (
+    HOSTED_CONTEXT_TOKENS,
     Delta,
     LLMConnectionError,
     LLMRateLimitError,
@@ -23,6 +24,7 @@ from src.llm.base import (
     ToolDef,
     ToolResult,
     Usage,
+    estimate_tokens,
 )
 
 _STOP_REASONS: dict[str, StopReason] = {
@@ -80,13 +82,23 @@ def _to_anthropic_messages(messages: Sequence[Message]) -> list[dict]:
 class AnthropicBackend:
     provider = "anthropic"
 
-    def __init__(self, client: anthropic.AsyncAnthropic, model: str) -> None:
+    def __init__(
+        self, client: anthropic.AsyncAnthropic, model: str, *, context_tokens: int = HOSTED_CONTEXT_TOKENS
+    ) -> None:
         self._client = client
         self._model = model
+        self._context_tokens = context_tokens
 
     @property
     def model(self) -> str:
         return self._model
+
+    def estimate_tokens(self, text: str) -> int:
+        # Claude's digit grouping is unpublished.
+        return estimate_tokens(text)
+
+    async def prompt_budget(self, max_tokens: int) -> int:
+        return self._context_tokens
 
     async def stream(
         self,

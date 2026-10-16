@@ -15,6 +15,8 @@ import openai
 from openai.types.completion_usage import CompletionUsage
 
 from src.llm.base import (
+    DIGITS_PER_TOKEN_GROUPED,
+    HOSTED_CONTEXT_TOKENS,
     Delta,
     LLMConnectionError,
     LLMRateLimitError,
@@ -27,6 +29,7 @@ from src.llm.base import (
     ToolCallDelta,
     ToolDef,
     Usage,
+    estimate_tokens,
 )
 
 _STOP_REASONS: dict[str, StopReason] = {
@@ -90,13 +93,27 @@ def _to_openai_messages(system: str, messages: Sequence[Message]) -> list[dict]:
 class OpenAIBackend:
     provider = "openai"
 
-    def __init__(self, client: openai.AsyncOpenAI, model: str) -> None:
+    # Chat Completions' name for the output cap; `max_tokens` is deprecated
+    # and rejected by OpenAI's reasoning models.
+    max_tokens_param = "max_completion_tokens"
+
+    def __init__(
+        self, client: openai.AsyncOpenAI, model: str, *, context_tokens: int = HOSTED_CONTEXT_TOKENS
+    ) -> None:
         self._client = client
         self._model = model
+        self._context_tokens = context_tokens
 
     @property
     def model(self) -> str:
         return self._model
+
+    def estimate_tokens(self, text: str) -> int:
+        # tiktoken's encodings group digits in threes.
+        return estimate_tokens(text, DIGITS_PER_TOKEN_GROUPED)
+
+    async def prompt_budget(self, max_tokens: int) -> int:
+        return self._context_tokens
 
     async def stream(
         self,
@@ -109,8 +126,7 @@ class OpenAIBackend:
     ) -> AsyncIterator[Delta]:
         request: dict[str, Any] = {
             "model": self._model,
-            # `max_tokens` is deprecated and rejected by reasoning models.
-            "max_completion_tokens": max_tokens,
+            self.max_tokens_param: max_tokens,
             "messages": _to_openai_messages(system, messages),
             "stream": True,
             "stream_options": {"include_usage": True},

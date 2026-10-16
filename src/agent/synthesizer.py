@@ -18,7 +18,7 @@ from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from src.agent.archive import record_output
-from src.agent.memory import AssembledContext, build_context, context_budget, estimate_tokens
+from src.agent.memory import AssembledContext, build_context
 from src.llm import LLMBackend, Message, collect
 
 
@@ -101,9 +101,12 @@ class SignalSynthesizer:
 
     async def _background(self, tickers: list[str], prompt_so_far: str) -> AssembledContext | None:
         """Prior briefings and the latest snapshot for `tickers`."""
-        budget = max(0, context_budget("synthesis") - estimate_tokens(prompt_so_far))
+        room = await self._backend.prompt_budget(self.MAX_TOKENS)
+        budget = max(0, room - self._backend.estimate_tokens(prompt_so_far))
         try:
-            return await build_context(self._engine, "synthesis", budget, scope_tickers=tickers)
+            return await build_context(
+                self._engine, "synthesis", budget, scope_tickers=tickers, count=self._backend.estimate_tokens
+            )
         except Exception:
             logger.exception("synthesizer: memory unavailable; briefing without background")
             return None

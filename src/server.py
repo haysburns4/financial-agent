@@ -27,6 +27,7 @@ from src.portfolio_history import coverage, history_rows, history_summary
 from src.pipelines.backfill_pipeline import BackfillPipeline
 from src.pipelines.portfolio_history_pipeline import SnapshotRunResult
 from src.scheduler import (
+    LLM_REPLY_TOKENS,
     agent_chat,
     portfolio_history_pipeline,
     portfolio_pipeline,
@@ -94,7 +95,7 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         ok = await health_check()
-        llm, alerts = await llm_health.llm_health(llm_health.MONITOR)
+        llm, alerts = await llm_health.llm_health(llm_health.MONITOR, reply_tokens=LLM_REPLY_TOKENS)
         history = archive = None
         if ok:
             try:

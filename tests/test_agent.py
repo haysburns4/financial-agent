@@ -124,7 +124,7 @@ async def test_agent_runs_a_tool_then_answers_with_the_result(engine, backend):
 
 async def test_a_tool_result_too_big_for_the_context_is_withheld(engine):
     # 13 price histories at ~8k tokens each overran a 24k local window and
-    # crashed the MLX server. The model must get an error it can act on instead.
+    # crashed the server running it. The model must get an error it can act on instead.
     await _seed_position(engine)
     backend = FakeBackend([tool_reply("get_positions", {}), text_reply("done")])
 

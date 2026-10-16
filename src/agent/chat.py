@@ -29,7 +29,7 @@ from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from src.agent.archive import record_output
-from src.agent.memory import AssembledContext, build_context, context_budget, estimate_tokens
+from src.agent.memory import AssembledContext, build_context
 from src.agent.tools import TOOLS, data_summary, known_accounts, mask_account, run_tool
 from src.config import settings
 from src.etrade.auth import auth as etrade_auth
@@ -75,9 +75,7 @@ _MEMORY_INTRO = (
     "current figures.\n\n"
 )
 # Tool definitions are sent with every request; counted against the budget.
-_TOOLS_TOKENS = estimate_tokens(
-    json.dumps([{"name": t.name, "description": t.description, "parameters": t.parameters} for t in TOOLS])
-)
+_TOOLS_JSON = json.dumps([{"name": t.name, "description": t.description, "parameters": t.parameters} for t in TOOLS])
 # agent_outputs.conversation_id is 40 characters; longer ids are hashed to fit.
 _CONVERSATION_ID_MAX = 40
 
@@ -128,10 +126,12 @@ class AgentChat:
     MAX_TOOL_ITERATIONS = 5
 
     def __init__(self, engine: AsyncEngine, backend: LLMBackend, context_tokens: int | None = None) -> None:
-        """`context_tokens` is the prompt budget; None takes the chat provider's."""
+        """`context_tokens` is the prompt budget; None asks the backend on
+        each turn, since a local server's window can change while we run."""
         self._engine = engine
         self._backend = backend
-        self._context_tokens = context_budget("chat") if context_tokens is None else context_tokens
+        self._context_tokens = context_tokens
+        self._tools_tokens = backend.estimate_tokens(_TOOLS_JSON)
 
     async def ask(
         self,
@@ -178,10 +178,15 @@ class AgentChat:
         started = time.monotonic()
         system_prompt, summary, highlighted = await self._prepare(account_id)
         messages = self._build_messages(question, history)
-        memory = await self._background(system_prompt, messages, turn.conversation_id, highlighted)
+        context_tokens = (
+            await self._backend.prompt_budget(self.MAX_TOKENS) if self._context_tokens is None else self._context_tokens
+        )
+        memory = await self._background(
+            system_prompt, messages, turn.conversation_id, highlighted, context_tokens - self._tools_tokens
+        )
         if memory is not None and memory.sections:
             system_prompt += _MEMORY_INTRO + memory.render()
-        room = self._context_tokens - _TOOLS_TOKENS - estimate_tokens(
+        room = context_tokens - self._tools_tokens - self._backend.estimate_tokens(
             system_prompt + "".join(m.text or "" for m in messages)
         )
         # After memory is built, so the question is not its own background.
@@ -232,15 +237,17 @@ class AgentChat:
         messages: list[Message],
         conversation_id: str,
         highlighted: str | None,
+        available: int,
     ) -> AssembledContext | None:
-        """Memory in what the budget leaves after the prompt, messages and tool
-        definitions; None if memory is unavailable. Tool results arrive later
+        """Memory in what the `available` tokens leave after the prompt and
+        messages; None if memory is unavailable. Tool results arrive later
         and are not foreseen here."""
-        used = estimate_tokens(system_prompt + _MEMORY_INTRO + "".join(m.text or "" for m in messages))
-        budget = max(0, self._context_tokens - used - _TOOLS_TOKENS)
+        used = self._backend.estimate_tokens(system_prompt + _MEMORY_INTRO + "".join(m.text or "" for m in messages))
+        budget = max(0, available - used)
         try:
             return await build_context(
                 self._engine, "chat", budget,
+                count=self._backend.estimate_tokens,
                 conversation_id=conversation_id,
                 account_id=highlighted,
                 # Those turns are already in `messages`, replayed by the caller.
@@ -306,13 +313,13 @@ class AgentChat:
             results = []
             for call in final.message.tool_calls:
                 result = await run_tool(self._engine, call, highlighted)
-                tokens = estimate_tokens(result.content)
+                tokens = self._backend.estimate_tokens(result.content)
                 if tokens > room:
                     logger.warning("chat: withheld {} result of ~{} tokens ({} left)", call.name, tokens, room)
                     result = ToolResult(
                         call.id, _OVER_BUDGET_RESULT.format(tokens=tokens, room=max(room, 0)), is_error=True
                     )
-                    tokens = estimate_tokens(result.content)
+                    tokens = self._backend.estimate_tokens(result.content)
                 room -= tokens
                 results.append(result)
                 yield result

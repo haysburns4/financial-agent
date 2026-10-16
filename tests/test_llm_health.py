@@ -6,7 +6,8 @@ from loguru import logger
 
 from src.config import settings
 from src.llm import health
-from src.llm.health import LocalServerMonitor, llm_health, log_startup, start_hint
+from src.llm.health import LocalServerMonitor, llm_health, log_startup
+from src.llm.local_profiles import SERVERS, start_hint
 
 BASE = "http://mlx.test/v1"
 MODEL = "mlx-community/Qwen3-14B-4bit"
@@ -148,11 +149,11 @@ async def test_startup_warns_with_the_url_and_how_to_start_the_server(logs):
         ("http://localhost:9001/v1", " --port 9001"),
         ("http://localhost/v1", " --port 80"),
         ("https://gpu-box/v1", " --port 443"),
-        ("http://localhost:99999/v1", ""),  # an invalid port is left to mlx_lm.server's default
+        ("http://localhost:99999/v1", " --port 8080"),  # an invalid port falls back to the server's default
     ],
 )
 def test_start_hint_uses_the_port_in_the_base_url(url, port_flag):
-    hint = start_hint(url, MODEL)
+    hint = start_hint(SERVERS["mlx"], url, MODEL)
     assert f"`uv run mlx_lm.server --model {MODEL}{port_flag}`" in hint
     assert "./start --with-local-llm" in hint
 
@@ -178,3 +179,82 @@ async def test_startup_does_not_probe_without_a_local_task(logs):
     summary = await log_startup(monitor, _local(LLM_PROVIDER="openai"))
 
     assert calls == [] and summary == "LLM chat=openai, synthesizer=openai"
+
+
+# ---------- server kinds and context windows ----------
+
+
+def _ollama(window: int, model: str = "qwen3:14b") -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/ps":
+            return httpx.Response(200, json={"models": [{"name": model, "model": model, "context_length": window}]})
+        return httpx.Response(200, json={"object": "list", "data": [{"id": model, "object": "model"}]})
+    return httpx.MockTransport(handler)
+
+
+OLLAMA = "http://ollama.test:11434/v1"
+
+
+def _on_ollama(**overrides):
+    return _local(LOCAL_LLM_SERVER="ollama", LOCAL_LLM_BASE_URL=OLLAMA, LOCAL_LLM_MODEL="qwen3:14b", **overrides)
+
+
+async def test_an_unreachable_server_is_named_by_its_kind():
+    monitor = LocalServerMonitor(OLLAMA, server="ollama", transport=_down())
+    _, alerts = await llm_health(monitor, _on_ollama())
+
+    assert "Ollama" in alerts[0] and "MLX" not in alerts[0]
+
+
+async def test_health_reports_the_window_and_alerts_when_the_budget_does_not_fit(logs):
+    monitor = LocalServerMonitor(OLLAMA, server="ollama", transport=_ollama(4096))
+    section, alerts = await llm_health(monitor, _on_ollama(LOCAL_LLM_CONTEXT_BUDGET=24_000))
+    local = section["local"]
+
+    assert local["server"] == "ollama" and local["context_windows"] == {"qwen3:14b": 4096}
+    assert len(alerts) == 2  # one per task: each is cut by its own reply size
+    assert all("4096-token context window" in a and "OLLAMA_CONTEXT_LENGTH" in a for a in alerts)
+
+
+async def test_the_window_must_also_hold_each_tasks_reply():
+    # 24k of prompt fits a 36k window, but not with chat's 16k reply on top;
+    # synthesis, with an 8k reply, still fits.
+    monitor = LocalServerMonitor(OLLAMA, server="ollama", transport=_ollama(36_000))
+    _, alerts = await llm_health(
+        monitor, _on_ollama(LOCAL_LLM_CONTEXT_BUDGET=24_000), reply_tokens={"chat": 16_000, "synthesizer": 8_000}
+    )
+
+    assert len(alerts) == 1
+    assert "plus up to 16000 reply tokens" in alerts[0] and "chat prompts are cut to 20000" in alerts[0]
+
+
+async def test_a_budget_inside_the_window_raises_no_alert():
+    monitor = LocalServerMonitor(OLLAMA, server="ollama", transport=_ollama(40_960))
+    _, alerts = await llm_health(monitor, _on_ollama(LOCAL_LLM_CONTEXT_BUDGET=24_000))
+
+    assert alerts == []
+
+
+async def test_startup_warns_about_a_small_window_and_says_how_to_raise_it(logs):
+    monitor = LocalServerMonitor(OLLAMA, server="ollama", transport=_ollama(4096))
+    await log_startup(monitor, _on_ollama())
+
+    assert any(line.startswith("WARNING") and "num_ctx" in line for line in logs)
+
+
+async def test_startup_hint_for_a_server_we_do_not_launch(logs):
+    monitor = LocalServerMonitor(OLLAMA, server="ollama", transport=_down())
+
+    await log_startup(monitor, _on_ollama())
+    warning = next(line for line in logs if line.startswith("WARNING"))
+    assert "`ollama serve`, then `ollama pull qwen3:14b`" in warning
+    assert "./start --with-local-llm" not in warning
+
+
+async def test_each_task_model_is_checked_against_what_the_server_serves(logs):
+    config = _local(LOCAL_LLM_MODEL_CHAT="mlx-community/Qwen3-4B-4bit")
+    section, _ = await llm_health(LocalServerMonitor(BASE, transport=_serving(MODEL)), config)
+    await log_startup(LocalServerMonitor(BASE, transport=_serving(MODEL)), config)
+
+    assert section["local"]["models"] == {"chat": "mlx-community/Qwen3-4B-4bit", "synthesizer": MODEL}
+    assert any(line.startswith("WARNING") and "LOCAL_LLM_MODEL_CHAT" in line for line in logs)

@@ -3,7 +3,7 @@
     ./start                  # set up if needed, then run the API and web UI
     ./start --dev            # same, with `next dev` instead of a production build
     ./start --backfill [5y]  # also refresh price history and recalibrate signal confidence
-    ./start --with-local-llm # also run mlx_lm.server for LLM_PROVIDER=local
+    ./start --with-local-llm # also run mlx_lm.server for LLM_PROVIDER=local (LOCAL_LLM_SERVER=mlx)
     ./start login            # E-Trade login against a running API (daily); or use the
                              # "Log in to E-Trade" button in the dashboard
     ./start setup [--all]    # ask for whatever .env is missing (or everything)
@@ -59,7 +59,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     start.add_argument(
         "--with-local-llm", action="store_true",
-        help="also run mlx_lm.server with LOCAL_LLM_MODEL (for LLM_PROVIDER=local), and stop it with the rest",
+        help="also run mlx_lm.server with LOCAL_LLM_MODEL (for LLM_PROVIDER=local, LOCAL_LLM_SERVER=mlx), and stop it with the rest",
     )
     login_cmd = commands.add_parser(
         "login",

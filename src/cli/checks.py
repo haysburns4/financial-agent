@@ -27,8 +27,9 @@ import requests
 from requests_oauthlib.oauth1_session import TokenRequestDenied
 
 from src.cli.env_file import EnvFile
-from src.cli.spec import BY_NAME, OPENAI_SDK_PROVIDERS, PROVIDER_KEYS, SPEC, problem, providers_in_use
+from src.cli.spec import BY_NAME, OPENAI_SDK_PROVIDERS, PROVIDER_KEYS, SPEC, local_models, problem, providers_in_use
 from src.etrade.errors import denied
+from src.llm.local_profiles import SERVERS, ServerProfile, server_profile, start_hint
 
 NETWORK_TIMEOUT = 10.0
 MIN_NODE_MAJOR = 20
@@ -75,7 +76,7 @@ def mask(value: str | None) -> str:
 class NetworkChecks(Protocol):
     def llm_key(self, provider: str, key: str) -> CheckResult: ...
 
-    def local_server(self, base_url: str) -> CheckResult: ...
+    def local_server(self, target: LocalServerTarget) -> CheckResult: ...
 
     def etrade_keys(self, consumer_key: str, consumer_secret: str) -> CheckResult: ...
 
@@ -153,10 +154,11 @@ def check_etrade_keys(
     return ok(name, "accepted")
 
 
-def check_local_server(base_url: str, client: httpx.Client) -> CheckResult:
-    """LLM_PROVIDER=local: is the MLX server answering, and with which models?"""
-    name = "local MLX server"
-    start = "start it with `./start --with-local-llm`"
+def check_local_server(target: LocalServerTarget, client: httpx.Client) -> CheckResult:
+    """LLM_PROVIDER=local: is the server answering, and with which models?"""
+    base_url = target.base_url
+    name = f"local LLM server ({target.server.label})"
+    start = start_hint(target.server, base_url, target.model)
     try:
         response = client.get(f"{base_url.rstrip('/')}/models")
     except httpx.HTTPError as exc:
@@ -181,9 +183,9 @@ class LiveNetworkChecks:
     def etrade_keys(self, consumer_key: str, consumer_secret: str) -> CheckResult:
         return check_etrade_keys(consumer_key, consumer_secret, timeout=self._timeout)
 
-    def local_server(self, base_url: str) -> CheckResult:
+    def local_server(self, target: LocalServerTarget) -> CheckResult:
         with httpx.Client(timeout=self._timeout) as client:
-            return check_local_server(base_url, client)
+            return check_local_server(target, client)
 
 
 # ---------- machine ----------
@@ -344,19 +346,21 @@ def check_provider_package(providers: set[str], system: System) -> CheckResult |
     return fail(name, f"provider {' and '.join(needing)} needs the openai package", "run `uv sync --extra dev --extra openai`")
 
 
-# ---------- local LLM (mlx_lm.server) ----------
+# ---------- local LLM (any OpenAI-compatible server) ----------
 
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 @dataclass(frozen=True)
 class LocalServerTarget:
-    """Where LOCAL_LLM_BASE_URL says the MLX server is, and the model it should serve."""
+    """Where LOCAL_LLM_BASE_URL says the server is, which kind it is, and the
+    model it should serve."""
 
     base_url: str
     host: str
     port: int
     model: str
+    server: ServerProfile = SERVERS["mlx"]
 
     @property
     def on_this_machine(self) -> bool:
@@ -374,7 +378,7 @@ def local_server_target(values: Mapping[str, str]) -> LocalServerTarget | None:
         return None
     if parts.scheme not in ("http", "https") or not parts.hostname:
         return None
-    return LocalServerTarget(base_url, parts.hostname, port, model)
+    return LocalServerTarget(base_url, parts.hostname, port, model, server_profile(values.get("LOCAL_LLM_SERVER")))
 
 
 def hf_cache_dir(environ: Mapping[str, str]) -> Path:
@@ -401,29 +405,36 @@ def model_downloaded(model: str, cache_dir: Path) -> bool:
 
 
 def check_local_llm(values: Mapping[str, str], environ: Mapping[str, str], system: System) -> list[CheckResult]:
-    """The local provider: mlx-lm installed, the model downloaded, the server's port answering."""
+    """The local provider: the server's port answering and, for a server
+    `./start` can launch, its package installed and each task's model downloaded."""
     if "local" not in providers_in_use(values):
         return []
-    results = []
-    if system.module_available("mlx_lm"):
-        results.append(ok("mlx-lm", "installed"))
-    else:
-        results.append(
-            warn("mlx-lm", "not installed; `./start --with-local-llm` needs it", "run `uv sync` (Apple Silicon only)")
-        )
-
     target = local_server_target(values)
     if target is None:
-        results.append(fail("LOCAL_LLM_BASE_URL", "is not an http(s) URL with a host", SETUP_HINT))
-        return results
+        return [fail("LOCAL_LLM_BASE_URL", "is not an http(s) URL with a host", SETUP_HINT)]
 
-    cache = hf_cache_dir(environ)
-    if model_downloaded(target.model, cache):
-        results.append(ok("local model", "downloaded"))
-    else:
-        results.append(
-            warn("local model", f"{target.model} is not in {cache}; the first run downloads it (several GB)")
-        )
+    results = []
+    if target.server.launchable:
+        if system.module_available("mlx_lm"):
+            results.append(ok("mlx-lm", "installed"))
+        else:
+            results.append(
+                warn("mlx-lm", "not installed; `./start --with-local-llm` needs it", "run `uv sync` (Apple Silicon only)")
+            )
+        cache = hf_cache_dir(environ)
+        models = local_models(values)
+        for model in models:
+            name = "local model" if len(models) == 1 else f"local model {model}"
+            if model_downloaded(model, cache):
+                results.append(ok(name, "downloaded"))
+            else:
+                results.append(warn(name, f"{model} is not in {cache}; the first run downloads it (several GB)"))
+        if len(models) > 1:
+            results.append(warn(
+                "local models",
+                f"mlx_lm.server holds one model at a time, so it reloads whenever {' and '.join(models)} take turns",
+                "use one LOCAL_LLM_MODEL for every task, unless the reload delay is acceptable",
+            ))
 
     if not target.on_this_machine:
         results.append(ok("local server port", f"{target.host} is another machine; checked over the network"))
@@ -432,7 +443,8 @@ def check_local_llm(values: Mapping[str, str], environ: Mapping[str, str], syste
         results.append(ok("local server port", f"{target.port} is listening ({holder})"))
     else:
         results.append(
-            warn("local server port", f"nothing is listening on {target.port}", "start it with `./start --with-local-llm`")
+            warn("local server port", f"nothing is listening on {target.port}",
+                 start_hint(target.server, target.base_url, target.model))
         )
     return results
 
@@ -445,7 +457,9 @@ def check_network(values: Mapping[str, str], network: NetworkChecks) -> list[Che
         results.append(network.etrade_keys(key, secret))
     for provider in sorted(providers_in_use(values)):
         if provider == "local":
-            results.append(network.local_server(values.get("LOCAL_LLM_BASE_URL") or BY_NAME["LOCAL_LLM_BASE_URL"].default or ""))
+            target = local_server_target(values)
+            if target is not None:  # an unusable URL is check_local_llm's to report
+                results.append(network.local_server(target))
         elif llm_key := values.get(PROVIDER_KEYS.get(provider, "")):
             results.append(network.llm_key(provider, llm_key))
     return results
