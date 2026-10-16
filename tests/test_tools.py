@@ -29,10 +29,10 @@ async def _seed(engine):
             [
                 {"ticker": "AAPL", "timestamp": datetime.now(timezone.utc),
                  "signal_type": "golden_cross", "direction": "up", "confidence": 0.75,
-                 "reasoning": "ema9 crossed ema21", "delivered": False},
+                 "reasoning": "ema9 crossed ema21"},
                 {"ticker": "MSFT", "timestamp": datetime.now(timezone.utc),
                  "signal_type": "death_cross", "direction": "down", "confidence": 0.75,
-                 "reasoning": "ema9 fell below ema21", "delivered": False},
+                 "reasoning": "ema9 fell below ema21"},
             ],
         )
 
@@ -86,7 +86,7 @@ async def test_lowercase_tickers_are_normalised(engine):
 
 def _signal(ticker, signal_type, confidence, ts):
     return {"ticker": ticker, "timestamp": ts, "signal_type": signal_type, "direction": None,
-            "confidence": confidence, "reasoning": "r", "delivered": True}
+            "confidence": confidence, "reasoning": "r"}
 
 
 async def test_overview_ranks_the_top_ten_and_counts_the_rest(engine):

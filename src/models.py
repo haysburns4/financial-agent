@@ -119,13 +119,6 @@ class Signal(Base):
     direction: Mapped[str | None] = mapped_column(String(10))
     confidence: Mapped[float]
     reasoning: Mapped[str] = mapped_column(Text)
-    # Set by the Discord tick (src/alerts/discord.py) once a signal is posted.
-    # TODO: One flag covers one channel; a second channel would never see what
-    # the first already claimed. Before adding one, move delivery to a
-    # signal_deliveries table keyed (signal_id, channel), claim rows with an
-    # UPDATE ... WHERE delivered IS false RETURNING so two workers can't both
-    # send, and drop this column.
-    delivered: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -153,15 +146,6 @@ class AgentOutput(Base):
     conversation_id: Mapped[str | None] = mapped_column(String(40), index=True)
     context_ref: Mapped[dict | None] = mapped_column(JSON)
     latency_ms: Mapped[int | None]
-    # For a future delivery channel to claim syntheses, like signals.delivered.
-    # TODO: Nothing sets this yet, so /agent/history/undelivered and /health's
-    # undelivered_syntheses just mirror the full synthesis history. When a
-    # channel (Discord, email) starts sending syntheses, have it read
-    # list_outputs(undelivered=True) and set the flag right after each
-    # successful send, as discord.py does for signals. If syntheses ever go to
-    # more than one channel, use a per-channel deliveries table instead, as
-    # noted on Signal.delivered.
-    delivered: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

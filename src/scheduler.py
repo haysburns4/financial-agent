@@ -10,7 +10,6 @@ from loguru import logger
 
 from src.agent.chat import AgentChat
 from src.agent.synthesizer import SignalSynthesizer
-from src.alerts.discord import deliver_pending_signals, post_daily_briefing
 from src.config import settings
 from src.db import engine
 from src.etrade.accounts import ETradeAccountClient
@@ -64,17 +63,16 @@ async def _price_then_signals() -> None:
     logger.info("price_pipeline firing for {} ticker(s): {}", len(tickers), tickers)
     await price_pipeline.run(tickers)
     await signal_engine.run_all(tickers)
-    # Per-tick Discord delivery is raw (no synthesizer) so we don't hit
-    # Claude every 5 minutes. The synthesizer runs once daily via the
-    # `_daily_briefing_job` cron job below, or on demand via /signals/synthesize.
-    sent = await deliver_pending_signals()
-    if sent:
-        logger.info("Discord delivered {} signal(s)", sent)
 
 
 async def _daily_briefing_run() -> None:
+    """Brief the last day's signals into the archive."""
     logger.info("daily briefing firing")
-    await post_daily_briefing(signal_synthesizer)
+    briefing = await signal_synthesizer.brief_recent()
+    if briefing is None:
+        logger.info("daily briefing: no signals in the last 24h; skipping")
+    else:
+        logger.info("daily briefing archived ({} signal(s) summarized)", len(briefing.signals))
 
 
 def _daily_briefing_job() -> None:

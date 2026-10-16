@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from src.agent.archive import archive_summary, get_output, list_outputs
 from src.agui import create_agui_router
-from src.alerts.discord import build_synthesis_context
 from src.backtest import persistence as backtest_persistence
 from src.backtest.calibration import calibrate
 from src.signals.catchup import catch_up
@@ -267,7 +266,6 @@ def create_app() -> FastAPI:
                 "direction": r.direction,
                 "confidence": r.confidence,
                 "reasoning": r.reasoning,
-                "delivered": r.delivered,
             }
             for r in rows
         ]
@@ -311,17 +309,6 @@ def create_app() -> FastAPI:
             "last_updated": last_updated.isoformat() if last_updated else None,
             "authenticated": await auth.is_authenticated(),
         }
-
-    # Literal paths before /agent/history/{output_id}, whose int converter
-    # also keeps "undelivered" from matching it.
-    @app.get("/agent/history/undelivered")
-    async def agent_history_undelivered(
-        type: Literal["synthesis", "chat"] = "synthesis",
-        limit: int = Query(100, ge=1, le=1000),
-        conn: AsyncConnection = Depends(_conn_dep),
-    ):
-        """Outputs no delivery channel has claimed yet, newest first."""
-        return await list_outputs(conn, output_type=type, undelivered=True, limit=limit)
 
     @app.get("/agent/history")
     async def agent_history(
@@ -587,41 +574,22 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"chat failed: {exc}") from exc
 
     @app.post("/signals/synthesize")
-    async def synthesize_signals(conn: AsyncConnection = Depends(_conn_dep)):
-        rows = (
-            await conn.execute(
-                select(Signal)
-                .where(Signal.delivered.is_(False))
-                .order_by(Signal.created_at)
-            )
-        ).all()
-        if not rows:
-            return {"narrative": "No undelivered signals.", "signals": []}
-
-        signal_dicts = [
-            {
-                "id": r.id,
-                "ticker": r.ticker,
-                "timestamp": r.timestamp,
-                "signal_type": r.signal_type,
-                "direction": r.direction,
-                "confidence": r.confidence,
-                "reasoning": r.reasoning,
-            }
-            for r in rows
-        ]
+    async def synthesize_signals(hours: int = Query(24, ge=1, le=24 * 30)):
+        """A briefing on the signals of the last `hours`, archived like the
+        daily one."""
         try:
-            context = await build_synthesis_context(conn, signal_dicts)
-            narrative = await signal_synthesizer.synthesize(signal_dicts, context)
+            briefing = await signal_synthesizer.brief_recent(hours)
         except Exception as exc:
             from loguru import logger
             logger.exception("/signals/synthesize failed")
             raise HTTPException(
                 status_code=500, detail=f"synthesis failed: {exc}"
             ) from exc
+        if briefing is None:
+            return {"narrative": f"No signals in the last {hours}h.", "signals": []}
 
         return {
-            "narrative": narrative,
+            "narrative": briefing.narrative,
             "signals": [
                 {
                     "id": s["id"],
@@ -630,7 +598,7 @@ def create_app() -> FastAPI:
                     "direction": s["direction"],
                     "confidence": s["confidence"],
                 }
-                for s in signal_dicts
+                for s in briefing.signals
             ],
         }
 

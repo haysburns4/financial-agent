@@ -90,7 +90,6 @@ async def record_output(
                         conversation_id=conversation_id,
                         context_ref=context_ref,
                         latency_ms=latency_ms,
-                        delivered=False,
                     )
                     .returning(AgentOutput.id)
                 )
@@ -123,7 +122,6 @@ def output_dict(row: Row) -> dict:
         "conversation_id": row.conversation_id,
         "context_ref": row.context_ref,
         "latency_ms": row.latency_ms,
-        "delivered": row.delivered,
     }
 
 
@@ -135,7 +133,6 @@ async def list_outputs(
     ticker: str | None = None,
     start: date | None = None,
     end: date | None = None,
-    undelivered: bool = False,
     limit: int = 100,
 ) -> list[dict]:
     """Archived outputs, newest first."""
@@ -156,8 +153,6 @@ async def list_outputs(
         stmt = stmt.where(AgentOutput.timestamp >= datetime.combine(start, time.min, timezone.utc))
     if end is not None:
         stmt = stmt.where(AgentOutput.timestamp < datetime.combine(end + timedelta(days=1), time.min, timezone.utc))
-    if undelivered:
-        stmt = stmt.where(AgentOutput.delivered.is_(False))
     stmt = stmt.order_by(AgentOutput.timestamp.desc(), AgentOutput.id.desc()).limit(limit)
     return [output_dict(r) for r in (await conn.execute(stmt)).all()]
 
@@ -177,13 +172,12 @@ async def get_output(conn: AsyncConnection, output_id: int) -> dict | None:
 
 async def archive_summary(conn: AsyncConnection) -> dict:
     """The /health "agent_archive" section."""
-    total, syntheses, chat_turns, undelivered, latest = (
+    total, syntheses, chat_turns, latest = (
         await conn.execute(
             select(
                 func.count(),
                 func.count().filter(AgentOutput.output_type == "synthesis"),
                 func.count().filter(AgentOutput.output_type == "chat"),
-                func.count().filter(AgentOutput.output_type == "synthesis", AgentOutput.delivered.is_(False)),
                 func.max(AgentOutput.timestamp),
             )
         )
@@ -192,7 +186,6 @@ async def archive_summary(conn: AsyncConnection) -> dict:
         "total_outputs": total,
         "syntheses": syntheses,
         "chat_turns": chat_turns,
-        "undelivered_syntheses": undelivered,
         "latest_output_at": _utc(latest).isoformat() if latest else None,
     }
 

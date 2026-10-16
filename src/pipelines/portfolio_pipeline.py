@@ -7,13 +7,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import delete, update
+from sqlalchemy import delete
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from src.etrade.accounts import ETradeAccountClient
 from src.etrade.auth import auth as etrade_auth
-from src.models import PipelineRun, Position
+from src.models import Position
+from src.pipelines import finish_run, start_run
 
 
 @dataclass
@@ -51,17 +52,9 @@ class PortfolioPipeline:
         account_summaries: list[dict] = []
         errors: list[str] = []
 
-        async with self._engine.begin() as conn:
-            run_id = (
-                await conn.execute(
-                    sqlite_insert(PipelineRun).values(
-                        pipeline="portfolio_pipeline",
-                        started_at=started,
-                        status="running",
-                    )
-                )
-            ).inserted_primary_key[0]
-
+        run_id = await start_run(self._engine, "portfolio_pipeline", started)
+        status = "failed"
+        try:
             accounts = await self._accounts.list_accounts()
             logger.info("portfolio_pipeline: {} account(s) returned", len(accounts))
 
@@ -73,59 +66,52 @@ class PortfolioPipeline:
                     continue
 
                 try:
-                    async with conn.begin_nested():
-                        raw = await self._accounts.get_positions(account_id_key)
-                        normalized = self._normalize(account_id, raw)
+                    raw = await self._accounts.get_positions(account_id_key)
+                    normalized = self._normalize(account_id, raw)
+                    async with self._engine.begin() as conn:
                         pruned = await self._reconcile(conn, account_id, normalized)
-                        positions_stored += len(normalized)
-                        accounts_processed += 1
+                    positions_stored += len(normalized)
+                    accounts_processed += 1
 
-                        total_mv = sum(p["market_value"] for p in normalized)
-                        tickers = [p["ticker"] for p in normalized]
-                        account_summaries.append({
-                            "account_id": account_id,
-                            "tickers": tickers,
-                            "position_count": len(normalized),
-                            "total_market_value": total_mv,
-                            "positions_pruned": pruned,
-                        })
-                        if pruned:
-                            logger.info(
-                                "Account {}: {} positions, ${:,.0f} market value ({} closed positions pruned)",
-                                account_id,
-                                len(normalized),
-                                total_mv,
-                                pruned,
-                            )
-                        else:
-                            logger.info(
-                                "Account {}: {} positions, ${:,.0f} market value",
-                                account_id,
-                                len(normalized),
-                                total_mv,
-                            )
+                    total_mv = sum(p["market_value"] for p in normalized)
+                    tickers = [p["ticker"] for p in normalized]
+                    account_summaries.append({
+                        "account_id": account_id,
+                        "tickers": tickers,
+                        "position_count": len(normalized),
+                        "total_market_value": total_mv,
+                        "positions_pruned": pruned,
+                    })
+                    if pruned:
+                        logger.info(
+                            "Account {}: {} positions, ${:,.0f} market value ({} closed positions pruned)",
+                            account_id,
+                            len(normalized),
+                            total_mv,
+                            pruned,
+                        )
+                    else:
+                        logger.info(
+                            "Account {}: {} positions, ${:,.0f} market value",
+                            account_id,
+                            len(normalized),
+                            total_mv,
+                        )
                 except Exception as exc:
                     logger.exception("portfolio_pipeline failed for account {}", account_id)
                     errors.append(f"{account_id}: {exc}")
 
-            completed = datetime.now(timezone.utc)
             if errors and accounts_processed == 0:
                 status = "failed"
             elif errors:
                 status = "partial"
             else:
                 status = "ok"
-
-            await conn.execute(
-                update(PipelineRun)
-                .where(PipelineRun.id == run_id)
-                .values(
-                    completed_at=completed,
-                    status=status,
-                    tickers_processed=positions_stored,
-                    errors="\n".join(errors) if errors else None,
-                )
-            )
+        finally:
+            # Also on an unexpected error (list_accounts raising), so the run
+            # is not left "running".
+            completed = datetime.now(timezone.utc)
+            await finish_run(self._engine, run_id, completed, status, positions_stored, errors)
 
         result = PortfolioRunResult(
             started_at=started,

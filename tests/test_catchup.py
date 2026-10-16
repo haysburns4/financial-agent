@@ -64,7 +64,6 @@ async def test_records_what_fired_since_the_last_check_at_its_real_time(engine):
     signals = await _signals(engine)
     assert [(s.ticker, s.signal_type) for s in signals] == [("AAPL", "breakout")]
     assert signals[0].timestamp.replace(tzinfo=UTC) == after  # the bar's time, not now
-    assert signals[0].delivered  # never pushed to Discord after the fact
     assert "Caught up after a backfill." in signals[0].reasoning
     assert signals[0].reasoning.endswith("Confirmed by daily uptrend (EMA9 > EMA21, close above EMA21).")
     assert result.recorded == {"breakout": 1}
@@ -100,7 +99,7 @@ async def test_deduplicates_like_the_live_engine(engine):
     async with engine.begin() as conn:
         await conn.execute(insert(Signal), [{
             "ticker": "AAPL", "timestamp": _at(FRI, 15), "signal_type": "breakout", "direction": "long",
-            "confidence": 0.4, "reasoning": "live", "delivered": False,
+            "confidence": 0.4, "reasoning": "live",
         }])
 
     result = await catch_up(engine, ["AAPL"], now=NOW, signal_engine=_engine(engine))

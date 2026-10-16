@@ -142,7 +142,7 @@ class SignalCandidate:
     confidence: float
     reasoning: str
 
-    def to_row(self, delivered: bool = False) -> dict:
+    def to_row(self) -> dict:
         return {
             "ticker": self.ticker,
             "timestamp": self.timestamp,
@@ -150,7 +150,6 @@ class SignalCandidate:
             "direction": self.direction,
             "confidence": self.confidence,
             "reasoning": self.reasoning,
-            "delivered": delivered,
         }
 
 
@@ -520,7 +519,7 @@ class SignalEngine:
         ]
 
     async def record(
-        self, conn: AsyncConnection, candidate: SignalCandidate, delivered: bool = False
+        self, conn: AsyncConnection, candidate: SignalCandidate
     ) -> int | None:
         """Insert a confirmed candidate unless it duplicates one already recorded.
 
@@ -533,7 +532,7 @@ class SignalEngine:
                 candidate.signal_type, candidate.ticker, self.DEDUP_WINDOW, candidate.timestamp,
             )
             return None
-        res = await conn.execute(insert(Signal).values(**candidate.to_row(delivered=delivered)))
+        res = await conn.execute(insert(Signal).values(**candidate.to_row()))
         logger.info(
             "signal: {} {} ({:.2f}) — {}",
             candidate.ticker, candidate.signal_type, candidate.confidence, candidate.reasoning,

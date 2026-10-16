@@ -9,8 +9,7 @@ records what fired at the bar's real time.
 
 Rule evaluation and confirmation are the backtest's (src/backtest/runner.py,
 src/signals/confirmation.py); recording, dedup and confidence are the live
-engine's (`SignalEngine.record`, `_conf`). Caught-up signals are stored as
-already delivered, so a backfill never floods Discord with old signals.
+engine's (`SignalEngine.record`, `_conf`).
 """
 from collections import Counter
 from dataclasses import dataclass, field
@@ -138,7 +137,7 @@ async def catch_up(
                         direction=_DIRECTIONS.get(rule), confidence=_conf(rule, ticker),
                         reasoning=reasoning,
                     )
-                    if await recorder.record(conn, candidate, delivered=True) is None:
+                    if await recorder.record(conn, candidate) is None:
                         result.duplicates += 1
                     else:
                         recorded[rule] += 1

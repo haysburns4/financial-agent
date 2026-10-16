@@ -69,7 +69,7 @@ async def test_synthesis_is_archived_with_its_provider_model_and_refs(engine):
     [row] = await _outputs(engine)
     assert row.content == narrative == "NVDA broke out; worth watching."
     assert (row.output_type, row.role, row.provider, row.model) == ("synthesis", None, "fake", "claude-sonnet-5")
-    assert row.context_ref["signal_ids"] == [7] and row.latency_ms is not None and not row.delivered
+    assert row.context_ref["signal_ids"] == [7] and row.latency_ms is not None
     assert await _refs(engine, row.id) == [("signal_id", "7"), ("ticker", "NVDA"), ("account_id", "84719991")]
 
 
@@ -309,18 +309,6 @@ async def test_one_output_comes_with_its_context_and_refs(engine, client):
     assert (await client.get("/agent/history/999")).status_code == 404
 
 
-async def test_undelivered_lists_syntheses_not_yet_delivered(engine, client):
-    first = await _narrative(engine, "first", ["NVDA"], days_ago=2)
-    second = await _narrative(engine, "second", ["NVDA"])
-    async with engine.begin() as conn:
-        await conn.execute(AgentOutput.__table__.update().where(AgentOutput.id == first).values(delivered=True))
-    await record_output(engine, "chat", "not a synthesis", "fake", "fake-1", role="user")
-
-    body = (await client.get("/agent/history/undelivered", params={"type": "synthesis"})).json()
-
-    assert [o["id"] for o in body] == [second]
-
-
 async def test_archive_summary_counts_for_health(engine):
     from src.agent.archive import archive_summary
 
@@ -333,9 +321,9 @@ async def test_archive_summary_counts_for_health(engine):
         summary = await archive_summary(conn)
 
     assert empty == {"total_outputs": 0, "syntheses": 0, "chat_turns": 0,
-                     "undelivered_syntheses": 0, "latest_output_at": None}
+                     "latest_output_at": None}
     assert {k: v for k, v in summary.items() if k != "latest_output_at"} == {
-        "total_outputs": 3, "syntheses": 1, "chat_turns": 2, "undelivered_syntheses": 1,
+        "total_outputs": 3, "syntheses": 1, "chat_turns": 2,
     }
     assert summary["latest_output_at"] is not None
 

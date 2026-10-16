@@ -75,16 +75,11 @@ class Tickers:
 
 
 @dataclass(frozen=True)
-class HttpsUrl:
-    pass
-
-
-@dataclass(frozen=True)
 class FernetKey:
     pass
 
 
-ValueRule = Credential | Text | Boolean | Integer | Choice | Tickers | HttpsUrl | FernetKey
+ValueRule = Credential | Text | Boolean | Integer | Choice | Tickers | FernetKey
 
 
 @dataclass(frozen=True)
@@ -226,10 +221,6 @@ SPEC: tuple[SettingSpec, ...] = (
         "Capture a portfolio history snapshot each time the API starts.", Boolean(),
     ),
     SettingSpec(
-        "DISCORD_WEBHOOK_URL", None, True,
-        "Discord webhook for alerts; leave blank to disable.", HttpsUrl(),
-    ),
-    SettingSpec(
         "TOKEN_ENCRYPTION_KEY", None, True,
         "Fernet key that keeps the E-Trade login across restarts; blank keeps tokens in memory only.",
         FernetKey(),
@@ -321,9 +312,6 @@ def _rule_problem(rule: ValueRule, value: str) -> str | None:
             bad = [t for t in tickers if not _TICKER.match(t)]
             if bad:
                 return f"has invalid tickers: {', '.join(bad)}"
-        case HttpsUrl():
-            if not value.startswith("https://"):
-                return "must be an https:// URL"
         case FernetKey():
             try:
                 Fernet(value.encode())

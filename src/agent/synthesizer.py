@@ -2,24 +2,28 @@
 
 Goes through the provider-neutral LLM layer. Given a list of signal dicts plus context
 (positions and recent bars per ticker), asks the model for a ≤200-word
-actionable briefing. Callers (Discord alerter, /signals/synthesize endpoint)
-substitute this narrative for raw per-signal posts.
+actionable briefing. `brief_recent` does this for the signals of the last day;
+the daily scheduled run and POST /signals/synthesize call it.
 
 The signals and their context are the input. Background comes from memory
 (src/agent/memory.py): the prior briefings on the same tickers, so a briefing
 says what changed instead of repeating yesterday's. Every briefing is archived
-(src/agent/archive.py) whatever the caller does with it — scheduled runs with
-no delivery channel included.
+(src/agent/archive.py): that archive is where briefings go, and what chat
+memory draws on.
 """
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy import and_, select
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from src.agent.archive import record_output
 from src.agent.memory import AssembledContext, build_context
 from src.llm import LLMBackend, Message, collect
+from src.models import Indicator, Position, PriceBar, Signal
 
 
 _SYSTEM_PROMPT = (
@@ -33,6 +37,13 @@ _SYSTEM_PROMPT = (
     "they already said as new: say what has changed since, or that it persists."
 )
 _BACKGROUND_INTRO = "\n\n# Background (from earlier runs; may be out of date)\n\n"
+_BARS_PER_TICKER = 5
+
+
+@dataclass(frozen=True)
+class Briefing:
+    narrative: str
+    signals: list[dict]
 
 
 class SignalSynthesizer:
@@ -43,6 +54,33 @@ class SignalSynthesizer:
     def __init__(self, backend: LLMBackend, engine: AsyncEngine) -> None:
         self._backend = backend
         self._engine = engine
+
+    async def brief_recent(self, hours: int = 24) -> Briefing | None:
+        """A briefing on the signals that fired in the last `hours`, by bar
+        time — so a catch-up that records last month's signals today does not
+        sweep them in; None if there were none. The model is called after the
+        reads, with no connection open."""
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        async with self._engine.connect() as conn:
+            rows = (
+                await conn.execute(select(Signal).where(Signal.timestamp >= since).order_by(Signal.timestamp))
+            ).all()
+            signals = [
+                {
+                    "id": r.id,
+                    "ticker": r.ticker,
+                    "timestamp": r.timestamp,
+                    "signal_type": r.signal_type,
+                    "direction": r.direction,
+                    "confidence": r.confidence,
+                    "reasoning": r.reasoning,
+                }
+                for r in rows
+            ]
+            if not signals:
+                return None
+            context = await build_synthesis_context(conn, signals)
+        return Briefing(await self.synthesize(signals, context), signals)
 
     async def synthesize(self, signals: list[dict], context: dict) -> str:
         """Produce a narrative summary for the given signals.
@@ -159,6 +197,56 @@ class SignalSynthesizer:
                     )
 
         return "\n".join(lines)
+
+
+async def build_synthesis_context(conn: AsyncConnection, signals: list[dict]) -> dict:
+    """Positions and the last few bars, with indicators, per affected ticker."""
+    tickers = sorted({s["ticker"] for s in signals if s.get("ticker")})
+
+    positions_stmt = select(Position).where(Position.ticker.in_(tickers)).order_by(Position.ticker)
+    positions = [
+        {
+            "account_id": r.account_id,
+            "ticker": r.ticker,
+            "quantity": r.quantity,
+            "cost_basis": r.cost_basis,
+            "market_value": r.market_value,
+        }
+        for r in (await conn.execute(positions_stmt)).all()
+    ]
+
+    bars_by_ticker: dict[str, list[dict]] = {}
+    for ticker in tickers:
+        stmt = (
+            select(
+                PriceBar.timestamp, PriceBar.open, PriceBar.high, PriceBar.low,
+                PriceBar.close, PriceBar.volume,
+                Indicator.rsi_14, Indicator.macd_line, Indicator.macd_signal,
+                Indicator.macd_hist, Indicator.ema_9, Indicator.ema_21,
+            )
+            .outerjoin(
+                Indicator,
+                and_(PriceBar.ticker == Indicator.ticker, PriceBar.timestamp == Indicator.timestamp),
+            )
+            .where(PriceBar.ticker == ticker)
+            .order_by(PriceBar.timestamp.desc())
+            .limit(_BARS_PER_TICKER)
+        )
+        rows = (await conn.execute(stmt)).all()
+        if not rows:
+            continue
+        bars_by_ticker[ticker] = [
+            {
+                "timestamp": r.timestamp,
+                "open": r.open, "high": r.high, "low": r.low,
+                "close": r.close, "volume": r.volume,
+                "rsi_14": r.rsi_14, "macd_line": r.macd_line,
+                "macd_signal": r.macd_signal, "macd_hist": r.macd_hist,
+                "ema_9": r.ema_9, "ema_21": r.ema_21,
+            }
+            for r in reversed(rows)
+        ]
+    return {"positions": positions, "bars_by_ticker": bars_by_ticker}
 
 
 def _fmt(value: Any) -> str:  # anti-slop: allow no-any-parameters - indicator values arrive from DB rows as float/None/Decimal

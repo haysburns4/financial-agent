@@ -123,8 +123,6 @@ def test_cli_package_does_not_import_config():
         ("WATCHLIST", "AAPL,BRK.B", None),
         ("WATCHLIST", " , ", "WATCHLIST must list at least one ticker"),
         ("LLM_PROVIDER", "gemini", "LLM_PROVIDER must be one of: anthropic, openai, local"),
-        ("DISCORD_WEBHOOK_URL", "", None),
-        ("DISCORD_WEBHOOK_URL", "http://x", "DISCORD_WEBHOOK_URL must be an https:// URL"),
         ("TOKEN_ENCRYPTION_KEY", "not-a-key", "TOKEN_ENCRYPTION_KEY is not a valid Fernet key"),
     ],
 )

@@ -2,14 +2,40 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from loguru import logger
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy import event, make_url, text
+from sqlalchemy.engine.interfaces import DBAPIConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.pool import ConnectionPoolEntry
 
 from src import models  # noqa: F401  — ensures all tables are registered on Base.metadata
 from src.config import settings
 from src.models import Base
 
-engine = create_async_engine(settings.DATABASE_URL, future=True)
+# How long a SQLite write waits for another writer.
+SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
+
+
+def _is_sqlite(url: str) -> bool:
+    return make_url(url).get_backend_name() == "sqlite"
+
+
+def make_engine(url: str) -> AsyncEngine:
+    """An engine for `url`; SQLite gets a busy timeout and WAL journaling."""
+    if not _is_sqlite(url):
+        return create_async_engine(url, future=True)
+    created = create_async_engine(url, future=True, connect_args={"timeout": SQLITE_BUSY_TIMEOUT_SECONDS})
+
+    @event.listens_for(created.sync_engine, "connect")
+    def _wal(dbapi_connection: DBAPIConnection, _record: ConnectionPoolEntry) -> None:
+        # Readers does not wait on the writer, nor it on them.
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    return created
+
+
+engine = make_engine(settings.DATABASE_URL)
 
 
 @asynccontextmanager

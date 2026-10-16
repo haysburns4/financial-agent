@@ -6,12 +6,13 @@ from typing import Any
 
 import pandas as pd
 from loguru import logger
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from src.etrade.market import ETradeMarketClient
-from src.models import Indicator, PipelineRun, PriceBar
+from src.models import Indicator, PriceBar
+from src.pipelines import finish_run, start_run
 from src.pipelines.validators import RawPriceBar, ValidatedPriceBar
 from src.signals.confirmation import is_daily
 from src.signals.technical import compute_indicators
@@ -55,17 +56,9 @@ class PricePipeline:
 
         logger.info("price_pipeline starting for {} tickers", len(tickers))
 
-        async with self._engine.begin() as conn:
-            run_id = (
-                await conn.execute(
-                    sqlite_insert(PipelineRun).values(
-                        pipeline="price_pipeline",
-                        started_at=started,
-                        status="running",
-                    )
-                )
-            ).inserted_primary_key[0]
-
+        run_id = await start_run(self._engine, "price_pipeline", started)
+        status = "failed"
+        try:
             for ticker in tickers:
                 if self._is_circuit_open(ticker):
                     self._tick_circuit(ticker)
@@ -78,35 +71,28 @@ class PricePipeline:
                     continue
 
                 try:
-                    async with conn.begin_nested():
-                        stored, flagged = await self._process_ticker(conn, ticker)
-                        bars_stored += stored
-                        bars_flagged += flagged
-                        processed += 1
-                        self._reset_circuit(ticker)
+                    logger.info("Fetching {}...", ticker)
+                    quotes = await self._market.get_quotes([ticker])
+                    async with self._engine.begin() as conn:
+                        stored, flagged = await self._store_ticker(conn, ticker, quotes)
+                    bars_stored += stored
+                    bars_flagged += flagged
+                    processed += 1
+                    self._reset_circuit(ticker)
                 except Exception as exc:
                     logger.exception("price_pipeline failed for {}", ticker)
                     errors.append(f"{ticker}: {exc}")
                     self._record_failure(ticker)
 
-            completed = datetime.now(timezone.utc)
             if errors and processed == 0:
                 status = "failed"
             elif errors:
                 status = "partial"
             else:
                 status = "ok"
-
-            await conn.execute(
-                update(PipelineRun)
-                .where(PipelineRun.id == run_id)
-                .values(
-                    completed_at=completed,
-                    status=status,
-                    tickers_processed=processed,
-                    errors="\n".join(errors) if errors else None,
-                )
-            )
+        finally:
+            completed = datetime.now(timezone.utc)
+            await finish_run(self._engine, run_id, completed, status, processed, errors)
 
         result = PipelineRunResult(
             started_at=started,
@@ -129,11 +115,10 @@ class PricePipeline:
         )
         return result
 
-    async def _process_ticker(
-        self, conn: AsyncConnection, ticker: str
+    async def _store_ticker(
+        self, conn: AsyncConnection, ticker: str, quotes: list[dict[str, Any]]
     ) -> tuple[int, int]:
-        logger.info("Fetching {}...", ticker)
-        quotes = await self._market.get_quotes([ticker])
+        """Validate `quotes` into bars and write them with their indicators."""
         if not quotes:
             raise RuntimeError(f"no quotes returned for {ticker}")
 

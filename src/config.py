@@ -52,7 +52,6 @@ class Settings(BaseSettings):
     PORTFOLIO_POLL_MINUTES: int = 15
     SNAPSHOT_ON_STARTUP: bool = True
 
-    DISCORD_WEBHOOK_URL: str | None = None
 
     # Fernet key for encrypting persisted E-Trade tokens. Generate with:
     #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
