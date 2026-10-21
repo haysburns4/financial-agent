@@ -53,7 +53,6 @@ def test_first_run_asks_the_whole_flow_in_order(root):
             ("anthropic API key", ANTHROPIC_KEY),
             ("Chat model", "<default>"),
             ("Synthesis model", "<default>"),
-            ("Watchlist", "aapl, nvda"),
         ]
     )
     run(root, io)
@@ -62,7 +61,6 @@ def test_first_run_asks_the_whole_flow_in_order(root):
     assert written.get("ETRADE_CONSUMER_KEY") == ETRADE_KEY
     assert written.get("ANTHROPIC_API_KEY") == ANTHROPIC_KEY
     assert written.get("LLM_CHAT_MODEL") == "claude-opus-5"
-    assert written.get("WATCHLIST") == "AAPL,NVDA"
     assert written.get("TOKEN_ENCRYPTION_KEY")
     assert (root / "web" / ".env.local").exists()
     # The template's comments came along.
@@ -90,10 +88,10 @@ def test_complete_env_asks_nothing(root):
 
 
 def test_invalid_value_is_asked_for(root):
-    (root / ".env").write_text(COMPLETE.replace("WATCHLIST=AAPL,MSFT", "WATCHLIST=AAPL,NOT A TICKER"))
-    io = ScriptedPrompter([("Watchlist", "AAPL,MSFT,NVDA")])
+    (root / ".env").write_text(COMPLETE + "PRICE_POLL_MINUTES=never\n")
+    io = ScriptedPrompter([("PRICE_POLL_MINUTES", "10")])
     run(root, io)
-    assert env(root).get("WATCHLIST") == "AAPL,MSFT,NVDA"
+    assert env(root).get("PRICE_POLL_MINUTES") == "10"
 
 
 def test_rejected_etrade_keys_are_asked_again(root):
@@ -128,14 +126,14 @@ def test_a_stored_key_the_provider_rejects_is_asked_again(root):
 
 
 def test_unknown_lines_survive(root):
-    (root / ".env").write_text("# my notes\nCUSTOM_THING='keep me'\n\n" + COMPLETE.replace("WATCHLIST=AAPL,MSFT\n", ""))
-    io = ScriptedPrompter([("Watchlist", "<default>")])
+    (root / ".env").write_text("# my notes\nCUSTOM_THING='keep me'\n\n" + COMPLETE.replace(f"ANTHROPIC_API_KEY={ANTHROPIC_KEY}\n", ""))
+    io = ScriptedPrompter([("anthropic API key", ANTHROPIC_KEY)])
 
     run(root, io)
 
     text = (root / ".env").read_text()
     assert text.startswith("# my notes\nCUSTOM_THING='keep me'\n\n")
-    assert env(root).get("WATCHLIST") == "AAPL,MSFT,GOOGL,AMZN,NVDA"
+    assert env(root).get("ANTHROPIC_API_KEY") == ANTHROPIC_KEY
 
 
 def test_token_key_is_generated_once(root):
@@ -166,7 +164,6 @@ def test_no_secret_is_ever_shown(root):
             ("anthropic API key", ""),
             ("Chat model", "<default>"),
             ("Synthesis model", "<default>"),
-            ("Watchlist", "<default>"),
         ]
     )
     run(root, io, ask_all=True)
@@ -190,7 +187,6 @@ def test_switching_to_openai_suggests_its_models_and_installs_the_package(root):
             ("openai API key", "sk-openai-000000000000000000ef"),
             ("Chat model", "<default>"),
             ("Synthesis model", "<default>"),
-            ("Watchlist", "<default>"),
         ]
     )
 
@@ -213,7 +209,6 @@ def test_switching_to_local_asks_for_the_server_not_a_key(root):
             ("Local LLM server", "mlx"),
             ("mlx_lm.server URL", "<default>"),
             ("Model id", "<default>"),
-            ("Watchlist", "<default>"),
         ]
     )
 

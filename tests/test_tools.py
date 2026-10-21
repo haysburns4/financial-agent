@@ -6,9 +6,9 @@ import pytest
 from sqlalchemy import insert
 
 from src.agent import tools
-from src.agent.tools import TOOLS, data_summary, run_tool
+from src.agent.tools import TOOLS, Scope, data_summary, run_tool
 from src.llm import ToolCall
-from src.models import Indicator, Position, PriceBar, Signal
+from src.models import Indicator, Position, PriceBar, Signal, WatchlistItem
 
 
 async def _seed(engine):
@@ -163,9 +163,13 @@ async def _bar(engine, ticker: str, ts: datetime, rsi: float | None) -> None:
         await conn.execute(insert(Indicator), [{"ticker": ticker, "timestamp": ts, "rsi_14": rsi}])
 
 
-async def test_screen_indicators_ranks_the_latest_bar_of_each_ticker_by_rsi(engine, monkeypatch):
+async def test_screen_indicators_ranks_the_latest_bar_of_each_ticker_by_rsi(engine):
     await _seed(engine)
-    monkeypatch.setattr(tools.settings, "WATCHLIST", ["NUE", "V"])
+    async with engine.begin() as conn:
+        await conn.execute(insert(WatchlistItem), [
+            {"ticker": t, "tags": [], "added_at": datetime.now(timezone.utc), "backfill_status": "done"}
+            for t in ("NUE", "V")
+        ])
     now = datetime(2026, 10, 12, 17, 30, tzinfo=timezone.utc)
     await _bar(engine, "AAPL", now - timedelta(days=1), 20.0)  # superseded by the newer bar
     await _bar(engine, "AAPL", now, 61.234567)
@@ -231,7 +235,7 @@ def test_every_tool_has_a_handler():
 
 
 async def _call_highlighted(engine, name: str, arguments: dict | None = None, highlighted: str | None = "A1"):
-    result = await run_tool(engine, ToolCall(id="c1", name=name, arguments=arguments or {}), highlighted)
+    result = await run_tool(engine, ToolCall(id="c1", name=name, arguments=arguments or {}), Scope(highlighted))
     return result, json.loads(result.content) if not result.is_error else None
 
 
@@ -315,3 +319,40 @@ async def test_data_summary_counts_the_highlighted_accounts_positions(engine):
 
     assert summary["positions"] == 1
     assert summary["accounts"] == 2
+
+
+# ---------- the Watchlist tab ----------
+
+
+async def test_on_the_watchlist_tab_signals_cover_only_watchlist_tickers(engine):
+    await _seed(engine)  # A1 holds AAPL, A2 holds MSFT; AAPL golden_cross, MSFT death_cross
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as conn:
+        await conn.execute(insert(WatchlistItem), [
+            {"ticker": t, "tags": [], "added_at": now, "backfill_status": "done"} for t in ("NVDA", "MSFT")
+        ])
+        await conn.execute(insert(Signal), [
+            _signal("NVDA", "breakout", 0.6, now),
+            _signal("AAPL", "stop_loss_warning", 0.75, now),
+            _signal("MSFT", "stop_loss_warning", 0.75, now),
+        ])
+
+    result = await run_tool(engine, ToolCall(id="c1", name="get_signals", arguments={}), Scope(watchlist_only=True))
+    payload = json.loads(result.content)
+
+    assert {s["ticker"] for s in payload["top"]} == {"NVDA", "MSFT"}
+    assert [s["ticker"] for s in payload["alerts"]] == ["MSFT"]
+
+
+async def test_on_the_watchlist_tab_the_screen_skips_held_only_tickers(engine):
+    await _seed(engine)
+    async with engine.begin() as conn:
+        await conn.execute(insert(WatchlistItem).values(
+            ticker="NVDA", tags=[], added_at=datetime.now(timezone.utc), backfill_status="done",
+        ))
+
+    result = await run_tool(
+        engine, ToolCall(id="c1", name="screen_indicators", arguments={}), Scope(watchlist_only=True)
+    )
+
+    assert json.loads(result.content)["no_indicators"] == ["NVDA"]

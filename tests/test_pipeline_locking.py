@@ -42,9 +42,9 @@ class _Market:
     async def get_quotes(self, tickers: list[str]) -> list[dict]:
         await _write_elsewhere(self._other)
         return [{
-            "ticker": tickers[0], "timestamp": NOW, "last": 100.0, "close": 99.0,
+            "ticker": ticker, "timestamp": NOW, "last": 100.0, "close": 99.0,
             "open": 99.5, "high": 100.5, "low": 99.0, "volume": 1000.0,
-        }]
+        } for ticker in tickers]
 
 
 class _Accounts:

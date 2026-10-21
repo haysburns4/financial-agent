@@ -29,6 +29,7 @@ from src.signals.confirmation import (
     required_trend,
     trend_from_bar,
 )
+from src.watchlist.resolver import get_monitored
 
 
 def _conf(rule_name: str, ticker: str | None = None, fallback: float = 0.5) -> float:
@@ -223,9 +224,16 @@ class SignalEngine:
             candidate = replace(candidate, reasoning=f"{candidate.reasoning.rstrip()} {note}")
         return candidate, decision
 
-    async def run_all(self, tickers: list[str]) -> list[dict]:
+    async def run_all(self, tickers: list[str] | None = None) -> list[dict]:
+        """Evaluate and record signals for `tickers` (default: all monitored).
+        Tickers without ready indicators get risk rules only."""
         inserted: list[dict] = []
         emitted_portfolio: set[str] = set()  # within-run dedup for portfolio-wide types
+
+        monitored = await get_monitored(self._engine)
+        if tickers is None:
+            tickers = [m.ticker for m in monitored]
+        not_ready = {m.ticker for m in monitored if not m.indicators_ready}
 
         async with self._engine.begin() as conn:
             portfolio = await self._load_portfolio(conn)
@@ -233,7 +241,10 @@ class SignalEngine:
                 ticker = ticker.strip().upper()
                 history = await self._load_history(conn, ticker, self.HISTORY_LIMIT)
                 position = await self._load_position(conn, ticker)
-                candidates = self._build_candidates(ticker, history, position, portfolio)
+                rules_ready = ticker not in not_ready
+                if not rules_ready:
+                    logger.debug("{}: indicators not ready (backfill pending); skipping entry/exit rules", ticker)
+                candidates = self._build_candidates(ticker, history, position, portfolio, rules_ready)
 
                 for c in candidates:
                     confirmed, decision = await self._confirm(conn, c)
@@ -266,9 +277,11 @@ class SignalEngine:
         history: pd.DataFrame,
         position: dict | None,
         portfolio: list[dict],
+        rules_ready: bool = True,
     ) -> list[SignalCandidate]:
+        """Entry/exit candidates when `rules_ready`."""
         out: list[SignalCandidate] = []
-        if not history.empty and len(history) >= 2:
+        if rules_ready and not history.empty and len(history) >= 2:
             out.extend(self._entry_signals(ticker, history))
             out.extend(self._exit_signals(ticker, history))
         if position is not None:

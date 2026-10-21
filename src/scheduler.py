@@ -16,11 +16,12 @@ from src.etrade.accounts import ETradeAccountClient
 from src.etrade.auth import auth
 from src.etrade.market import ETradeMarketClient
 from src.llm import backend_for
-from src.pipelines import monitored_tickers
+from src.pipelines.backfill_pipeline import BackfillPipeline
 from src.pipelines.portfolio_pipeline import PortfolioPipeline
 from src.pipelines.price_pipeline import PricePipeline
 from src.pipelines.portfolio_history_pipeline import PortfolioHistoryPipeline
 from src.signals.engine import SignalEngine
+from src.watchlist.service import WatchlistService
 
 
 _NYSE_TZ = ZoneInfo("America/New_York")
@@ -48,6 +49,9 @@ price_pipeline = PricePipeline(market_client, engine)
 portfolio_pipeline = PortfolioPipeline(account_client, engine)
 portfolio_history_pipeline = PortfolioHistoryPipeline(engine, portfolio=portfolio_pipeline)
 signal_engine = SignalEngine(engine)
+watchlist_service = WatchlistService(
+    engine, market_client, BackfillPipeline(engine, settings), settings.WATCHLIST_MAX_SIZE
+)
 # Each task asks for its own backend; provider routing lives in src/llm/factory.py.
 signal_synthesizer = SignalSynthesizer(backend_for("synthesizer"), engine)
 agent_chat = AgentChat(engine, backend_for("chat"))
@@ -59,10 +63,9 @@ async def _price_then_signals() -> None:
     if not await auth.is_authenticated():
         logger.warning("price_pipeline skipped: E-Trade not authenticated")
         return
-    tickers = await monitored_tickers(engine)
-    logger.info("price_pipeline firing for {} ticker(s): {}", len(tickers), tickers)
-    await price_pipeline.run(tickers)
-    await signal_engine.run_all(tickers)
+    logger.info("price_pipeline firing")
+    await price_pipeline.run()
+    await signal_engine.run_all()
 
 
 async def _daily_briefing_run() -> None:

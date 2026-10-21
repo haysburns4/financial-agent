@@ -11,7 +11,8 @@ large the watchlist and position set grow. The prompt carries only enough
 orientation for the model to know what is worth asking for.
 
 The account highlighted on the dashboard (forwarded by the caller) is the one
-analyzed by default per the prompt.
+analyzed by default per the prompt. With the Watchlist tab open, signals cover
+only watchlist tickers.
 
 Each turn is archived (src/agent/archive.py) as a user row and an assistant row
 sharing a conversation id: the caller's, or a new one returned for threading.
@@ -30,8 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from src.agent.archive import record_output
 from src.agent.memory import AssembledContext, build_context
-from src.agent.tools import TOOLS, data_summary, known_accounts, mask_account, run_tool
-from src.config import settings
+from src.agent.tools import TOOLS, Scope, data_summary, known_accounts, mask_account, run_tool
 from src.etrade.auth import auth as etrade_auth
 from src.llm import (
     Delta,
@@ -42,6 +42,7 @@ from src.llm import (
     TextDelta,
     ToolResult,
 )
+from src.watchlist.resolver import monitored_on
 
 _SYSTEM_PROMPT_TEMPLATE = (
     "You are a financial analysis assistant with access to the user's equity "
@@ -53,7 +54,10 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "reach (real-time quotes, news, fundamentals, predictions), say so clearly and "
     "offer what you can answer instead. Be concise, and reference specific tickers, "
     "positions and signals by name. Refer to an account by the last four digits "
-    "of its number (e.g. ••9991), as the dashboard does; never write it in full."
+    "of its number (e.g. ••9991), as the dashboard does; never write it in full. "
+    "The user's watchlist notes record their intent for a ticker; let them shape "
+    "how you frame its signals. You can read the watchlist but not change it: "
+    "if asked to add or remove a ticker, tell the user to use the watchlist panel."
 )
 
 _HIGHLIGHT_NOTE = (
@@ -61,6 +65,12 @@ _HIGHLIGHT_NOTE = (
     "only that account; the account tools cover it unless you pass another "
     "account_id. Look at another account, or all of them, only when the user "
     "explicitly asks, and say which account each figure comes from when you do."
+)
+
+_WATCHLIST_NOTE = (
+    "\n\nThe user is on the dashboard's Watchlist tab. Signals and the indicator "
+    "screen cover only watchlist tickers; discuss signals for those alone. For "
+    "signals on other holdings, tell the user to switch to an account tab."
 )
 
 _STALE_AUTH_NOTE = (
@@ -139,11 +149,13 @@ class AgentChat:
         conversation_history: list[dict] | None = None,
         account_id: str | None = None,
         conversation_id: str | None = None,
+        watchlist_only: bool = False,
     ) -> dict:
         """`account_id` is the highlighted account; None analyzes every account.
-        The response carries the conversation id to send with the next turn."""
+        `watchlist_only` means the Watchlist tab is open. The response carries
+        the conversation id to send with the next turn."""
         turn = _Turn(conversation_key(conversation_id))
-        async for _ in self._turn(question, conversation_history, account_id, turn):
+        async for _ in self._turn(question, conversation_history, account_id, watchlist_only, turn):
             pass
         return {
             "answer": turn.answer,
@@ -157,13 +169,14 @@ class AgentChat:
         conversation_history: list[dict] | None = None,
         account_id: str | None = None,
         conversation_id: str | None = None,
+        watchlist_only: bool = False,
     ) -> AsyncIterator[Delta | ToolResult]:
         """`ask` in streaming form, for the AG-UI/CopilotKit endpoint.
 
         Yields provider deltas plus a `ToolResult` for each tool the agent runs.
         """
         turn = _Turn(conversation_key(conversation_id))
-        async for item in self._turn(question, conversation_history, account_id, turn):
+        async for item in self._turn(question, conversation_history, account_id, watchlist_only, turn):
             yield item
 
     async def _turn(
@@ -171,12 +184,13 @@ class AgentChat:
         question: str,
         history: list[dict] | None,
         account_id: str | None,
+        watchlist_only: bool,
         turn: _Turn,
     ) -> AsyncIterator[Delta | ToolResult]:
         """One question, start to finish: prompt, memory, the tool loop, and
         the archive. Fills `turn` once the answer is complete."""
         started = time.monotonic()
-        system_prompt, summary, highlighted = await self._prepare(account_id)
+        system_prompt, summary, highlighted = await self._prepare(account_id, watchlist_only)
         messages = self._build_messages(question, history)
         context_tokens = (
             await self._backend.prompt_budget(self.MAX_TOKENS) if self._context_tokens is None else self._context_tokens
@@ -198,7 +212,7 @@ class AgentChat:
 
         answer: list[str] = []
         tools_called: list[dict] = []
-        async for item in self._run(system_prompt, messages, highlighted, room):
+        async for item in self._run(system_prompt, messages, Scope(highlighted, watchlist_only), room):
             if isinstance(item, TextDelta):
                 answer.append(item.text)
             elif isinstance(item, MessageComplete):
@@ -211,6 +225,7 @@ class AgentChat:
         turn.answer = "".join(answer).strip()
         turn.context_used = {
             "highlighted_account": highlighted,
+            "watchlist_only": watchlist_only,
             "tools_called": tools_called,
             "data_freshness_minutes": summary["data_freshness_minutes"],
             "memory": memory.summary() if memory is not None else None,
@@ -257,7 +272,7 @@ class AgentChat:
             logger.exception("chat: memory unavailable; answering without background")
             return None
 
-    async def _prepare(self, account_id: str | None) -> tuple[str, dict, str | None]:
+    async def _prepare(self, account_id: str | None, watchlist_only: bool) -> tuple[str, dict, str | None]:
         """Build the system prompt from a cheap summary of what data exists."""
         async with self._engine.begin() as conn:
             highlighted = account_id
@@ -266,10 +281,13 @@ class AgentChat:
                                mask_account(highlighted))
                 highlighted = None
             summary = await data_summary(conn, highlighted)
+            watchlist = [m.ticker for m in await monitored_on(conn) if m.source != "held"]
 
-        prompt = _SYSTEM_PROMPT_TEMPLATE.format(facts=_format_facts(summary, highlighted))
+        prompt = _SYSTEM_PROMPT_TEMPLATE.format(facts=_format_facts(summary, highlighted, watchlist))
         if highlighted is not None:
             prompt += _HIGHLIGHT_NOTE.format(account=mask_account(highlighted))
+        if watchlist_only:
+            prompt += _WATCHLIST_NOTE
         if not await etrade_auth.is_authenticated():
             prompt += _STALE_AUTH_NOTE
         return prompt, summary, highlighted
@@ -278,7 +296,7 @@ class AgentChat:
         self,
         system_prompt: str,
         messages: list[Message],
-        highlighted: str | None,
+        scope: Scope,
         room: int,
     ) -> AsyncIterator[Delta | ToolResult]:
         """Drive model -> tools -> model until the model stops asking for tools.
@@ -312,7 +330,7 @@ class AgentChat:
             messages.append(final.message)
             results = []
             for call in final.message.tool_calls:
-                result = await run_tool(self._engine, call, highlighted)
+                result = await run_tool(self._engine, call, scope)
                 tokens = self._backend.estimate_tokens(result.content)
                 if tokens > room:
                     logger.warning("chat: withheld {} result of ~{} tokens ({} left)", call.name, tokens, room)
@@ -346,7 +364,7 @@ class AgentChat:
         return messages
 
 
-def _format_facts(summary: dict, highlighted: str | None) -> str:
+def _format_facts(summary: dict, highlighted: str | None, watchlist: list[str]) -> str:
     freshness = summary["data_freshness_minutes"]
     holdings = (
         f"- {summary['positions']} positions in the highlighted account "
@@ -355,7 +373,7 @@ def _format_facts(summary: dict, highlighted: str | None) -> str:
         else f"- {summary['positions']} positions across {summary['accounts']} account(s)"
     )
     lines = [
-        f"- Watchlist: {', '.join(settings.WATCHLIST)}",
+        f"- Watchlist: {', '.join(watchlist) or '(empty)'}",
         holdings,
         f"- {summary['signals_recent']} signal(s) in the last 2 trading days",
     ]

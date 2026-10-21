@@ -35,6 +35,8 @@ from src.llm import MessageComplete, TextDelta, ToolCallDelta, ToolResult
 # The context entry the dashboard sends with every run (useAgentContext in
 # web/app/portfolio-panel.tsx): the selected account tab, or "all".
 HIGHLIGHTED_ACCOUNT_CONTEXT = "highlighted_account"
+# Sent alongside it: the open tab kind, "watchlist" or "accounts".
+DASHBOARD_TAB_CONTEXT = "dashboard_tab"
 
 
 def create_agui_router(chat: AgentChat) -> APIRouter:
@@ -58,6 +60,14 @@ def highlighted_account(context: Sequence[Context]) -> str | None:
             value = entry.value.strip()
             return None if not value or value.lower() == ALL_ACCOUNTS else value
     return None
+
+
+def watchlist_tab(context: Sequence[Context]) -> bool:
+    """Whether the dashboard has its Watchlist tab open."""
+    return any(
+        entry.description == DASHBOARD_TAB_CONTEXT and entry.value.strip().lower() == "watchlist"
+        for entry in context
+    )
 
 
 def split_conversation(messages: Sequence) -> tuple[str, list[dict]]:
@@ -107,9 +117,12 @@ async def _run(
     try:
         question, history = split_conversation(body.messages)
 
-        account_id = highlighted_account(body.context or ())
+        context = body.context or ()
+        account_id = highlighted_account(context)
 
-        async for delta in chat.ask_stream(question, history, account_id, body.thread_id):
+        async for delta in chat.ask_stream(
+            question, history, account_id, body.thread_id, watchlist_only=watchlist_tab(context)
+        ):
             if isinstance(delta, TextDelta):
                 if not text_open:
                     yield encoder.encode(

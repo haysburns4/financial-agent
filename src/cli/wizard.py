@@ -47,7 +47,6 @@ FLOW = (
     "LOCAL_LLM_MODEL",
     "LLM_CHAT_MODEL",
     "LLM_SYNTHESIS_MODEL",
-    "WATCHLIST",
 )
 
 
@@ -97,7 +96,6 @@ class Wizard:
         for name in used:
             self._provider_key(name)
         self._models(provider, provider_changed)
-        self._watchlist()
         self._invalid_others()
         self._agui_url()
         self._summary()
@@ -268,15 +266,6 @@ class Wizard:
             current = self.env.get(name)
             usable = current and not provider_changed and self._problem(name, current) is None
             self._set(name, self._ask_text(name, label, current if usable else fallback))
-
-    def _watchlist(self) -> None:
-        if not self._needs("WATCHLIST"):
-            return
-        current = self.env.get("WATCHLIST")
-        usable = current and self._problem("WATCHLIST", current) is None
-        default = current if usable else BY_NAME["WATCHLIST"].default or ""
-        answer = self._ask_text("WATCHLIST", "Watchlist (comma-separated tickers)", default)
-        self._set("WATCHLIST", ",".join(t.strip().upper() for t in answer.split(",") if t.strip()))
 
     def _invalid_others(self) -> None:
         """Settings outside the flow are left alone unless they would break startup."""

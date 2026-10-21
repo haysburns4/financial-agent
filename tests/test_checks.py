@@ -142,7 +142,7 @@ def test_shadowing_warns_when_the_shell_differs():
 
 
 def test_shadowing_ignores_unmanaged_and_dotenv_only_names():
-    assert check_shadowing({"WATCHLIST": "AAPL"}, {"PATH": "/bin", "CUSTOM": "1"}) == []
+    assert check_shadowing({"LOG_LEVEL": "DEBUG"}, {"PATH": "/bin", "CUSTOM": "1"}) == []
 
 
 # ---------- toolchain ----------

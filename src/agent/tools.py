@@ -9,10 +9,13 @@ tickers and clamps limits rather than passing values straight into a query.
 Account data (positions, risk, position alerts) covers the account highlighted
 on the dashboard by default; a call reaches other accounts only by naming one,
 or "all", in its `account_id` argument. Market data (entry/exit signals, price
-history) is not per account and is never narrowed.
+history) is not per account and is never narrowed by account. On the
+dashboard's Watchlist tab, signals and the indicator screen cover only
+watchlist tickers.
 """
 import json
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -20,12 +23,12 @@ from loguru import logger
 from sqlalchemy import Row, and_, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from src.config import settings
 from src.llm import ToolCall, ToolDef, ToolResult
 from src.models import Indicator, Position, PriceBar, Signal
 from src.portfolio import position_dict, risk_by_account
 from src.signals.confirmation import CONFIRMATION_RULES, minus_trading_days, required_trend
 from src.signals.engine import SIGNAL_CATEGORIES, signal_types_for_category
+from src.watchlist.resolver import monitored_on
 
 _CATEGORIES = sorted(set(SIGNAL_CATEGORIES.values()))
 # An account overview ranks only this many signals; the rest are counted.
@@ -37,6 +40,15 @@ _DEFAULT_SIGNAL_DAYS = 2
 _ALERT_RULES = frozenset(r for r in CONFIRMATION_RULES if required_trend(r) is None)
 # The `account_id` value that widens a call to every account.
 ALL_ACCOUNTS = "all"
+
+
+@dataclass(frozen=True)
+class Scope:
+    """What the dashboard is showing: the highlighted account (None for every
+    account), and whether the Watchlist tab is open."""
+
+    account: str | None = None
+    watchlist_only: bool = False
 
 
 def _account_arg(subject: str) -> dict:
@@ -137,8 +149,8 @@ TOOLS: tuple[ToolDef, ...] = (
 )
 
 
-async def run_tool(engine: AsyncEngine, call: ToolCall, highlighted: str | None = None) -> ToolResult:
-    """Execute one tool call on the highlighred account, returning its result as JSON.
+async def run_tool(engine: AsyncEngine, call: ToolCall, scope: Scope = Scope()) -> ToolResult:
+    """Execute one tool call within `scope`, returning its result as JSON.
 
     Never raises: a failure is reported back to the model as an error result so
     it can recover or explain, rather than killing the run.
@@ -150,7 +162,7 @@ async def run_tool(engine: AsyncEngine, call: ToolCall, highlighted: str | None 
 
     try:
         async with engine.begin() as conn:
-            payload = await handler(conn, call.arguments, highlighted)
+            payload = await handler(conn, call.arguments, scope)
     except Exception as exc:
         logger.exception("tool: {} failed", call.name)
         return ToolResult(call.id, f"{type(exc).__name__}: {exc}", is_error=True)
@@ -211,16 +223,16 @@ async def _account_scope(conn: AsyncConnection, args: dict, highlighted: str | N
     raise ValueError(f"account_id {requested!r} {problem} (accounts: {choices})")
 
 
-async def _get_positions(conn: AsyncConnection, args: dict, highlighted: str | None) -> list[dict]:
+async def _get_positions(conn: AsyncConnection, args: dict, scope: Scope) -> list[dict]:
     stmt = select(Position).order_by(Position.market_value.desc())
-    if account_id := await _account_scope(conn, args, highlighted):
+    if account_id := await _account_scope(conn, args, scope.account):
         stmt = stmt.where(Position.account_id == account_id)
     return [position_dict(r) for r in (await conn.execute(stmt)).all()]
 
 
-async def _get_portfolio_risk(conn: AsyncConnection, args: dict, highlighted: str | None) -> dict:
+async def _get_portfolio_risk(conn: AsyncConnection, args: dict, scope: Scope) -> dict:
     stmt = select(Position)
-    if account_id := await _account_scope(conn, args, highlighted):
+    if account_id := await _account_scope(conn, args, scope.account):
         stmt = stmt.where(Position.account_id == account_id)
     return risk_by_account((await conn.execute(stmt)).all())
 
@@ -238,22 +250,25 @@ def _signal_dict(r: Row) -> dict:
     }
 
 
-async def _get_signals(conn: AsyncConnection, args: dict, highlighted: str | None) -> dict:
+async def _get_signals(conn: AsyncConnection, args: dict, scope: Scope) -> dict:
     """An overview that stays short however many signals fired: the top few by
     confidence, a count per rule, and position alerts on their own.
 
     Alerts are about positions, so they are narrowed to the tickers the account
-    holds; entry/exit signals are about the market and are not."""
+    holds; entry/exit signals are about the market and are not. On the
+    Watchlist tab, both cover only watchlist tickers."""
     days = _clamp(args.get("days"), default=_DEFAULT_SIGNAL_DAYS, low=1, high=30)
     cutoff = minus_trading_days(datetime.now(timezone.utc), days)
     stmt = select(Signal).where(Signal.timestamp >= cutoff)
     if ticker := _ticker(args.get("ticker")):
         stmt = stmt.where(Signal.ticker == ticker)
+    if scope.watchlist_only:
+        stmt = stmt.where(Signal.ticker.in_(await _watchlist_tickers(conn)))
     if category := _text(args.get("category")):
         stmt = stmt.where(Signal.signal_type.in_(signal_types_for_category(category)))
     rows = (await conn.execute(stmt)).all()
     held: set[str] | None = None
-    if account_id := await _account_scope(conn, args, highlighted):
+    if account_id := await _account_scope(conn, args, scope.account):
         held = set(
             (await conn.scalars(select(Position.ticker).where(Position.account_id == account_id))).all()
         )
@@ -278,7 +293,7 @@ async def _get_signals(conn: AsyncConnection, args: dict, highlighted: str | Non
     }
 
 
-async def _get_price_history(conn: AsyncConnection, args: dict, highlighted: str | None) -> dict:
+async def _get_price_history(conn: AsyncConnection, args: dict, scope: Scope) -> dict:
     ticker = _ticker(args.get("ticker"))
     if not ticker:
         raise ValueError("ticker is required")
@@ -310,12 +325,15 @@ async def _get_price_history(conn: AsyncConnection, args: dict, highlighted: str
     }
 
 
-async def _screen_indicators(conn: AsyncConnection, args: dict, highlighted: str | None) -> dict:
+async def _screen_indicators(conn: AsyncConnection, args: dict, scope: Scope) -> dict:
     held_stmt = select(distinct(Position.ticker))
-    if account_id := await _account_scope(conn, args, highlighted):
+    if account_id := await _account_scope(conn, args, scope.account):
         held_stmt = held_stmt.where(Position.account_id == account_id)
     held = set((await conn.scalars(held_stmt)).all())
-    tickers = held | set(settings.WATCHLIST)
+    # Monitored tickers, narrowed to the account's holdings plus the watchlist,
+    # or to the watchlist alone on its tab.
+    watched = await _watchlist_tickers(conn)
+    tickers = watched if scope.watchlist_only else held | watched
 
     latest = (
         select(Indicator.ticker, func.max(Indicator.timestamp).label("timestamp"))
@@ -337,6 +355,10 @@ async def _screen_indicators(conn: AsyncConnection, args: dict, highlighted: str
         "tickers": rows,
         "no_indicators": sorted(tickers - {r["ticker"] for r in rows}),
     }
+
+
+async def _watchlist_tickers(conn: AsyncConnection) -> set[str]:
+    return {m.ticker for m in await monitored_on(conn) if m.source != "held"}
 
 
 _HANDLERS = {

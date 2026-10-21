@@ -120,8 +120,6 @@ def test_cli_package_does_not_import_config():
         ("ETRADE_SANDBOX", "False", None),
         ("PRICE_POLL_MINUTES", "0", "PRICE_POLL_MINUTES must be between 1 and 1440"),
         ("PRICE_POLL_MINUTES", "", "PRICE_POLL_MINUTES must be a whole number"),
-        ("WATCHLIST", "AAPL,BRK.B", None),
-        ("WATCHLIST", " , ", "WATCHLIST must list at least one ticker"),
         ("LLM_PROVIDER", "gemini", "LLM_PROVIDER must be one of: anthropic, openai, local"),
         ("TOKEN_ENCRYPTION_KEY", "not-a-key", "TOKEN_ENCRYPTION_KEY is not a valid Fernet key"),
     ],

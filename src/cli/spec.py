@@ -9,7 +9,6 @@ tests/test_spec.py fails if the two drift apart.
 from __future__ import annotations
 
 import argparse
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,16 +69,11 @@ class Choice:
 
 
 @dataclass(frozen=True)
-class Tickers:
-    pass
-
-
-@dataclass(frozen=True)
 class FernetKey:
     pass
 
 
-ValueRule = Credential | Text | Boolean | Integer | Choice | Tickers | FernetKey
+ValueRule = Credential | Text | Boolean | Integer | Choice | FernetKey
 
 
 @dataclass(frozen=True)
@@ -117,7 +111,6 @@ PROVIDER_KEYS: Mapping[str, str] = {
 # Pydantic's accepted spellings, lower-cased.
 _TRUE = frozenset({"1", "true", "t", "yes", "y", "on"})
 _FALSE = frozenset({"0", "false", "f", "no", "n", "off"})
-_TICKER = re.compile(r"^[A-Za-z0-9.^=-]{1,15}$")
 
 SPEC: tuple[SettingSpec, ...] = (
     SettingSpec(
@@ -206,8 +199,8 @@ SPEC: tuple[SettingSpec, ...] = (
         "SQLAlchemy async database URL.", Text(),
     ),
     SettingSpec(
-        "WATCHLIST", "AAPL,MSFT,GOOGL,AMZN,NVDA", False,
-        "Comma-separated tickers to track.", Tickers(),
+        "WATCHLIST_MAX_SIZE", "50", False,
+        "Most tickers the watchlist can hold; adds beyond it are rejected.", Integer(1, 500),
     ),
     SettingSpec(
         "PRICE_POLL_MINUTES", "5", False, "Minutes between price refreshes.", Integer(1, 1440)
@@ -305,13 +298,6 @@ def _rule_problem(rule: ValueRule, value: str) -> str | None:
         case Choice(options=options):
             if value.strip().lower() not in {o.lower() for o in options}:
                 return f"must be one of: {', '.join(options)}"
-        case Tickers():
-            tickers = [t.strip() for t in value.split(",") if t.strip()]
-            if not tickers:
-                return "must list at least one ticker"
-            bad = [t for t in tickers if not _TICKER.match(t)]
-            if bad:
-                return f"has invalid tickers: {', '.join(bad)}"
         case FernetKey():
             try:
                 Fernet(value.encode())

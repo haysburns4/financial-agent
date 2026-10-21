@@ -20,8 +20,7 @@ from src.db import engine, get_connection, health_check
 from src.etrade.auth import ETradeAuthError, auth
 from src.etrade.client import order_endpoints_blocked
 from src.llm import health as llm_health
-from src.models import Indicator, PipelineRun, Position, PriceBar, Signal
-from src.pipelines import monitored_tickers
+from src.models import Indicator, PipelineRun, Position, PriceBar, Signal, WatchlistItem
 from src.portfolio import dashboard, position_dict, risk_by_account, risk_summary
 from src.portfolio_history import coverage, history_rows, history_summary
 from src.pipelines.backfill_pipeline import BackfillPipeline
@@ -33,8 +32,12 @@ from src.scheduler import (
     portfolio_pipeline,
     price_pipeline,
     signal_synthesizer,
+    watchlist_service,
 )
 from src.signals.engine import FILTER_STATS, SIGNAL_CATEGORIES, signal_types_for_category
+from src.watchlist.resolver import get_monitored, monitored_on
+from src.watchlist.resolver import tickers as monitored_tickers
+from src.watchlist.service import UNSET, WatchlistError, active_count, list_events
 
 
 class CompleteAuthBody(BaseModel):
@@ -74,6 +77,36 @@ class WalkforwardRequest(BacktestRequest):
     step_months: int = 1
 
 
+class WatchlistAdd(BaseModel):
+    ticker: str
+    note: str | None = None
+    tags: list[str] | None = None
+    # The web UI sends "ui"; everything else is an API call.
+    source: Literal["ui", "api"] = "api"
+
+
+class WatchlistPatch(BaseModel):
+    # Omitted fields are left alone; `"note": null` clears the note.
+    note: str | None = None
+    tags: list[str] | None = None
+    source: Literal["ui", "api"] = "api"
+
+
+# How each service rejection reads over HTTP.
+_WATCHLIST_STATUS = {
+    "invalid_ticker": 422,
+    "invalid_tag": 422,
+    "unknown_symbol": 422,
+    "at_capacity": 409,
+    "not_failed": 409,
+    "not_found": 404,
+}
+
+
+def _watchlist_error(exc: WatchlistError) -> HTTPException:
+    return HTTPException(status_code=_WATCHLIST_STATUS[exc.code], detail=str(exc))
+
+
 class ChatTurn(BaseModel):
     role: str  # "user" | "assistant"
     content: str
@@ -86,6 +119,8 @@ class ChatRequest(BaseModel):
     account_id: str | None = None
     # From a previous response, to thread this turn into that conversation.
     conversation_id: str | None = None
+    # The dashboard's Watchlist tab is open: signals cover watchlist tickers only.
+    watchlist_only: bool = False
 
 
 def create_app() -> FastAPI:
@@ -96,14 +131,15 @@ def create_app() -> FastAPI:
     async def health():
         ok = await health_check()
         llm, alerts = await llm_health.llm_health(llm_health.MONITOR, reply_tokens=LLM_REPLY_TOKENS)
-        history = archive = None
+        history = archive = watchlist = None
         if ok:
             try:
                 async with get_connection() as conn:
                     history = await history_summary(conn)
                     archive = await archive_summary(conn)
+                    watchlist = await _watchlist_health(conn)
             except SQLAlchemyError:
-                logger.exception("health: portfolio history or agent archive unavailable")
+                logger.exception("health: portfolio history, agent archive or watchlist unavailable")
         # `service` lets the launcher recognise an instance it can reuse.
         # A down local LLM degrades the service: market data still collects.
         return {
@@ -120,6 +156,7 @@ def create_app() -> FastAPI:
             "alerts": alerts,
             "portfolio_history": history,
             "agent_archive": archive,
+            "watchlist": watchlist,
             "service": "financial-agent",
             "signal_filter_stats": {"last_24h": FILTER_STATS.last_24h()},
         }
@@ -163,7 +200,7 @@ def create_app() -> FastAPI:
         if tickers:
             ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
         else:
-            ticker_list = await monitored_tickers(engine)
+            ticker_list = monitored_tickers(await get_monitored(engine))
         result = await price_pipeline.run(ticker_list)
         return {
             "status": result.status,
@@ -176,6 +213,63 @@ def create_app() -> FastAPI:
             "bars_flagged": result.bars_flagged,
             "errors": result.errors,
         }
+
+    @app.get("/watchlist")
+    async def watchlist_active():
+        return [e.as_json() for e in await watchlist_service.list_active()]
+
+    @app.get("/watchlist/monitored")
+    async def watchlist_monitored():
+        return [asdict(m) for m in await get_monitored(engine)]
+
+    @app.get("/watchlist/events")
+    async def watchlist_events(
+        ticker: str | None = None,
+        limit: int = Query(100, ge=1, le=1000),
+        conn: AsyncConnection = Depends(_conn_dep),
+    ):
+        try:
+            return await list_events(conn, ticker, limit)
+        except WatchlistError as exc:
+            raise _watchlist_error(exc) from exc
+
+    @app.post("/watchlist", status_code=201)
+    async def watchlist_add(body: WatchlistAdd):
+        try:
+            entry = await watchlist_service.add(body.ticker, body.note, body.tags, source=body.source)
+        except WatchlistError as exc:
+            raise _watchlist_error(exc) from exc
+        return entry.as_json()
+
+    @app.patch("/watchlist/{ticker}")  # anti-slop: allow no-module-mocking - FastAPI PATCH route, not mock.patch
+    async def watchlist_patch(ticker: str, body: WatchlistPatch):
+        given = body.model_fields_set
+        try:
+            entry = await watchlist_service.update(
+                ticker,
+                note=body.note if "note" in given else UNSET,
+                tags=(body.tags or []) if "tags" in given else UNSET,
+                source=body.source,
+            )
+        except WatchlistError as exc:
+            raise _watchlist_error(exc) from exc
+        return entry.as_json()
+
+    @app.delete("/watchlist/{ticker}")
+    async def watchlist_remove(ticker: str, source: Literal["ui", "api"] = "api"):
+        try:
+            result = await watchlist_service.remove(ticker, source=source)
+        except WatchlistError as exc:
+            raise _watchlist_error(exc) from exc
+        return {**result.entry.as_json(), "held": result.held}
+
+    @app.post("/watchlist/{ticker}/backfill", status_code=202)
+    async def watchlist_retry_backfill(ticker: str):
+        try:
+            entry = await watchlist_service.retry_backfill(ticker)
+        except WatchlistError as exc:
+            raise _watchlist_error(exc) from exc
+        return entry.as_json()
 
     @app.get("/pipeline/runs")
     async def list_pipeline_runs(
@@ -405,7 +499,7 @@ def create_app() -> FastAPI:
     @app.post("/pipeline/backfill/run")
     async def trigger_backfill(body: BackfillRequest | None = None):
         body = body or BackfillRequest()
-        tickers = body.tickers or await monitored_tickers(engine)
+        tickers = body.tickers or monitored_tickers(await get_monitored(engine))
         pipeline = BackfillPipeline(engine, settings)
         from loguru import logger
         logger.info("backfill starting for {} ticker(s): {}", len(tickers), tickers)
@@ -511,7 +605,7 @@ def create_app() -> FastAPI:
 
     @app.post("/backtest/run")
     async def trigger_backtest(body: BacktestRequest):
-        tickers = body.tickers or await monitored_tickers(engine)
+        tickers = body.tickers or monitored_tickers(await get_monitored(engine))
         runner = BacktestRunner(engine)
         report = await runner.run(
             tickers=tickers,
@@ -533,7 +627,7 @@ def create_app() -> FastAPI:
 
     @app.post("/backtest/walkforward/run")
     async def trigger_walkforward(body: WalkforwardRequest):
-        tickers = body.tickers or await monitored_tickers(engine)
+        tickers = body.tickers or monitored_tickers(await get_monitored(engine))
         try:
             report = await BacktestRunner(engine).run_walkforward(
                 tickers=tickers,
@@ -575,7 +669,9 @@ def create_app() -> FastAPI:
             else None
         )
         try:
-            return await agent_chat.ask(body.question, history, body.account_id, body.conversation_id)
+            return await agent_chat.ask(
+                body.question, history, body.account_id, body.conversation_id, body.watchlist_only
+            )
         except Exception as exc:
             from loguru import logger
             logger.exception("/chat failed")
@@ -611,6 +707,25 @@ def create_app() -> FastAPI:
         }
 
     return app
+
+
+async def _watchlist_health(conn: AsyncConnection) -> dict:
+    monitored = await monitored_on(conn)
+    rows = (
+        await conn.execute(
+            select(WatchlistItem.ticker, WatchlistItem.backfill_status)
+            .where(WatchlistItem.removed_at.is_(None), WatchlistItem.backfill_status != "done")
+            .order_by(WatchlistItem.ticker)
+        )
+    ).all()
+    backfill: dict[str, list[str]] = {"pending": [], "running": [], "failed": []}
+    for r in rows:
+        backfill[r.backfill_status].append(r.ticker)
+    return {
+        "active": await active_count(conn),
+        "monitored": len(monitored),
+        "backfill": backfill,
+    }
 
 
 def _snapshot_result(result: SnapshotRunResult) -> dict:

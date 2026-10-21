@@ -10,12 +10,14 @@ from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from src.etrade.market import ETradeMarketClient
+from src.etrade.market import QUOTE_SYMBOL_LIMIT, ETradeMarketClient
 from src.models import Indicator, PriceBar
 from src.pipelines import finish_run, start_run
 from src.pipelines.validators import RawPriceBar, ValidatedPriceBar
 from src.signals.confirmation import is_daily
 from src.signals.technical import compute_indicators
+from src.watchlist.resolver import get_monitored
+from src.watchlist.service import mark_validated
 
 
 @dataclass
@@ -46,19 +48,25 @@ class PricePipeline:
         self._engine = engine
         self._circuit: dict[str, _CircuitState] = {}
 
-    async def run(self, tickers: list[str]) -> PipelineRunResult:
+    async def run(self, tickers: list[str] | None = None) -> PipelineRunResult:
+        """Fetch, validate and store quotes. `tickers` None means whatever is
+        monitored right now."""
         started = datetime.now(timezone.utc)
+        if tickers is None:
+            tickers = [m.ticker for m in await get_monitored(self._engine)]
         processed = 0
         skipped = 0
         bars_stored = 0
         bars_flagged = 0
         errors: list[str] = []
+        quoted: list[str] = []
 
         logger.info("price_pipeline starting for {} tickers", len(tickers))
 
         run_id = await start_run(self._engine, "price_pipeline", started)
         status = "failed"
         try:
+            live: list[str] = []
             for ticker in tickers:
                 if self._is_circuit_open(ticker):
                     self._tick_circuit(ticker)
@@ -68,21 +76,42 @@ class PricePipeline:
                         self._circuit[ticker].skip_runs_remaining,
                     )
                     skipped += 1
-                    continue
+                else:
+                    live.append(ticker)
 
+            # E-Trade quotes at most QUOTE_SYMBOL_LIMIT symbols per request.
+            for i in range(0, len(live), QUOTE_SYMBOL_LIMIT):
+                batch = live[i:i + QUOTE_SYMBOL_LIMIT]
+                logger.info("Fetching {}...", ", ".join(batch))
                 try:
-                    logger.info("Fetching {}...", ticker)
-                    quotes = await self._market.get_quotes([ticker])
-                    async with self._engine.begin() as conn:
-                        stored, flagged = await self._store_ticker(conn, ticker, quotes)
-                    bars_stored += stored
-                    bars_flagged += flagged
-                    processed += 1
-                    self._reset_circuit(ticker)
+                    quotes = await self._market.get_quotes(batch)
                 except Exception as exc:
-                    logger.exception("price_pipeline failed for {}", ticker)
-                    errors.append(f"{ticker}: {exc}")
-                    self._record_failure(ticker)
+                    logger.exception("price_pipeline quote batch failed for {}", batch)
+                    for ticker in batch:
+                        errors.append(f"{ticker}: {exc}")
+                        self._record_failure(ticker)
+                    continue
+                by_ticker: dict[str, list[dict[str, Any]]] = {}
+                for q in quotes:
+                    by_ticker.setdefault(str(q["ticker"]).upper(), []).append(q)
+
+                for ticker in batch:
+                    try:
+                        async with self._engine.begin() as conn:
+                            stored, flagged = await self._store_ticker(conn, ticker, by_ticker.get(ticker, []))
+                        bars_stored += stored
+                        bars_flagged += flagged
+                        processed += 1
+                        quoted.append(ticker)
+                        self._reset_circuit(ticker)
+                    except Exception as exc:
+                        logger.exception("price_pipeline failed for {}", ticker)
+                        errors.append(f"{ticker}: {exc}")
+                        self._record_failure(ticker)
+
+            if quoted:
+                async with self._engine.begin() as conn:
+                    await mark_validated(conn, quoted)
 
             if errors and processed == 0:
                 status = "failed"
