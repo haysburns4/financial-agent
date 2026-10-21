@@ -4,7 +4,8 @@ import { useAgentContext } from "@copilotkit/react-core/v2";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { EtradeLogin } from "./etrade-login";
-import { dashboardSchema, proxyErrorSchema, type Dashboard, type Position } from "./portfolio";
+import { dashboardSchema, maskAccount, proxyErrorSchema, type Dashboard, type Position } from "./portfolio";
+import { WatchlistView } from "./watchlist-view";
 
 // Stored positions change at most every PORTFOLIO_POLL_MINUTES (15) on the
 // server; polling faster than that only re-reads the same rows. It also notices
@@ -14,6 +15,9 @@ const POLL_MS = 60_000;
 // Sent with every chat run; must match HIGHLIGHTED_ACCOUNT_CONTEXT in src/agui.py.
 // The agent analyzes this account by default, "all" meaning every account.
 const HIGHLIGHTED_ACCOUNT_CONTEXT = "highlighted_account";
+// Must match DASHBOARD_TAB_CONTEXT: on the Watchlist tab, the agent's signals
+// cover only watchlist tickers.
+const DASHBOARD_TAB_CONTEXT = "dashboard_tab";
 
 type SortKey = "ticker" | "market_value" | "pnl" | "pnl_pct" | "weight";
 type Row = Position & { price: number | null; weight: number };
@@ -40,11 +44,6 @@ function tone(value: number | null): string {
   return value > 0 ? "gain" : "loss";
 }
 
-/** Show only the last four digits of an account number on screen. */
-function maskAccount(id: string): string {
-  return `••${id.slice(-4)}`;
-}
-
 function ago(iso: string, now: number): string {
   const minutes = Math.max(0, Math.round((now - Date.parse(iso)) / 60_000));
   if (minutes < 1) return "just now";
@@ -68,6 +67,9 @@ export function PortfolioPanel() {
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [account, setAccount] = useState<string | null>(null);
+  // The Watchlist tab replaces the positions table; the tiles keep the
+  // all-accounts totals, and the agent still analyzes every account.
+  const [watching, setWatching] = useState(false);
   const [sort, setSort] = useState<{ key: SortKey; descending: boolean }>({
     key: "market_value",
     descending: true,
@@ -106,11 +108,12 @@ export function PortfolioPanel() {
     if (!(await refresh())) await load("GET");
   }
 
-  const selected = data?.accounts.find((a) => a.account_id === account) ?? null;
+  const selected = watching ? null : (data?.accounts.find((a) => a.account_id === account) ?? null);
   const view = selected ?? data?.totals ?? null;
   // The tab on screen, not the raw state: an account gone after a refresh shows
   // (and is analyzed) as "All accounts".
   useAgentContext({ description: HIGHLIGHTED_ACCOUNT_CONTEXT, value: selected?.account_id ?? "all" });
+  useAgentContext({ description: DASHBOARD_TAB_CONTEXT, value: watching ? "watchlist" : "accounts" });
 
   const rows = useMemo<Row[]>(() => {
     if (!data) return [];
@@ -204,34 +207,52 @@ export function PortfolioPanel() {
             </div>
           </div>
 
-          {data.accounts.length > 1 && (
-            <div className="tabs" role="tablist" aria-label="Accounts">
-              <button
-                type="button"
-                role="tab"
-                aria-selected={selected === null}
-                onClick={() => setAccount(null)}
-              >
-                All accounts
-                <span className="tab-value">{usdWhole.format(data.totals.market_value)}</span>
-              </button>
-              {data.accounts.map((a) => (
+          <div className="tabs" role="tablist" aria-label="Accounts and watchlist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={!watching && selected === null}
+              onClick={() => {
+                setWatching(false);
+                setAccount(null);
+              }}
+            >
+              All accounts
+              <span className="tab-value">{usdWhole.format(data.totals.market_value)}</span>
+            </button>
+            {data.accounts.length > 1 &&
+              data.accounts.map((a) => (
                 <button
                   key={a.account_id}
                   type="button"
                   role="tab"
                   aria-selected={selected?.account_id === a.account_id}
-                  onClick={() => setAccount(a.account_id)}
+                  onClick={() => {
+                    setWatching(false);
+                    setAccount(a.account_id);
+                  }}
                   title={`Account ${a.account_id}`}
                 >
                   {maskAccount(a.account_id)}
                   <span className="tab-value">{usdWhole.format(a.market_value)}</span>
                 </button>
               ))}
-            </div>
-          )}
+            {/* Not an account: set apart at the far right of the row. */}
+            <button
+              type="button"
+              role="tab"
+              className="tab-end"
+              aria-selected={watching}
+              onClick={() => setWatching(true)}
+              title="Tickers you follow, plus everything you hold"
+            >
+              Watchlist
+            </button>
+          </div>
 
-          {rows.length === 0 ? (
+          {watching ? (
+            <WatchlistView />
+          ) : rows.length === 0 ? (
             <p className="placeholder">
               {data.authenticated
                 ? "No positions yet. Press Refresh to pull them from E-Trade."

@@ -34,7 +34,9 @@ _SYSTEM_PROMPT = (
     "consider. Never give direct buy/sell advice — frame as 'consider', "
     "'worth watching', 'may warrant review'. Keep it under 200 words. "
     "If earlier briefings are included as background, do not present what "
-    "they already said as new: say what has changed since, or that it persists."
+    "they already said as new: say what has changed since, or that it persists. "
+    "A user's note on a ticker records their intent (e.g. 'waiting on earnings'): "
+    "frame that ticker's signals in light of it."
 )
 _BACKGROUND_INTRO = "\n\n# Background (from earlier runs; may be out of date)\n\n"
 _BARS_PER_TICKER = 5

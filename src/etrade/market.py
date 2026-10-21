@@ -5,9 +5,10 @@ event loop isn't blocked. Network-level failures are retried via tenacity.
 """
 import asyncio
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
+from requests import HTTPError
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -16,6 +17,12 @@ from tenacity import (
 )
 
 from src.etrade.auth import ETradeAuth
+
+# Symbols per quote request.
+QUOTE_SYMBOL_LIMIT = 25
+
+# What a quote lookup says about a symbol.
+SymbolStatus = Literal["valid", "unknown", "unavailable"]
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:  # anti-slop: allow no-any-parameters - coerces untyped E-Trade JSON at the API boundary
@@ -29,7 +36,28 @@ class ETradeMarketClient:
     def __init__(self, auth: ETradeAuth) -> None:
         self._auth = auth
 
+    async def lookup_symbol(self, ticker: str) -> SymbolStatus:
+        """Whether E-Trade has a quote for `ticker`."""
+        if not await self._auth.is_authenticated():
+            return "unavailable"
+        try:
+            session = await self._auth.get_market_session()
+            payload = await asyncio.to_thread(self._get_quotes_sync, session, [ticker])
+        except HTTPError as exc:
+            # A 400 is E-Trade rejecting the symbol.
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 400:
+                return "unknown"
+            logger.warning("E-Trade symbol lookup for {} failed: {}", ticker, exc)
+            return "unavailable"
+        except Exception as exc:
+            logger.warning("E-Trade symbol lookup for {} failed: {}", ticker, exc)
+            return "unavailable"
+        quoted = {q["ticker"].upper() for q in self._parse_quotes(payload)}
+        return "valid" if ticker.upper() in quoted else "unknown"
+
     async def get_quotes(self, tickers: list[str]) -> list[dict]:
+        """Quotes for at most QUOTE_SYMBOL_LIMIT tickers; [] if the request fails."""
         if not tickers:
             return []
         try:
@@ -38,7 +66,11 @@ class ETradeMarketClient:
         except Exception:
             logger.exception("E-Trade get_quotes failed for {}", tickers)
             return []
+        return self._parse_quotes(payload)
 
+    @staticmethod
+    def _parse_quotes(payload: object) -> list[dict]:
+        """The usable quotes in a QuoteResponse."""
         quote_data = (
             payload.get("QuoteResponse", {}).get("QuoteData", [])
             if isinstance(payload, dict)

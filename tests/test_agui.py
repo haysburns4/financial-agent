@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from sqlalchemy import insert
 
 from src.agent.chat import AgentChat
-from src.agui import create_agui_router, highlighted_account, split_conversation
+from src.agui import create_agui_router, highlighted_account, split_conversation, watchlist_tab
 from src.llm import LLMStatusError
 from src.models import Position
 
@@ -212,3 +212,27 @@ async def test_the_dashboards_highlight_scopes_the_agents_tools(engine):
     result = next(e for e in events if e["type"] == "TOOL_CALL_RESULT")
     assert [p["ticker"] for p in json.loads(result["content"])] == ["MSFT"]
     assert "••0002" in backend.calls[0]["system"]
+
+
+@pytest.mark.parametrize(
+    ("context", "expected"),
+    [
+        ([{"description": "dashboard_tab", "value": "watchlist"}], True),
+        ([{"description": "dashboard_tab", "value": "accounts"}], False),
+        ([{"description": "something else", "value": "watchlist"}], False),
+        ([], False),
+    ],
+)
+def test_the_watchlist_tab_is_read_from_the_run_context(context, expected):
+    assert watchlist_tab([Context(**c) for c in context]) is expected
+
+
+async def test_the_watchlist_tab_tells_the_agent_to_stick_to_watchlist_signals(engine):
+    backend = FakeBackend([text_reply("Nothing new.")])
+
+    await _post(
+        engine, backend, [_user("any signals?")],
+        context=[{"description": "dashboard_tab", "value": "watchlist"}],
+    )
+
+    assert "Watchlist tab" in backend.calls[0]["system"]

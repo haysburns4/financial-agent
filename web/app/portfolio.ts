@@ -48,3 +48,8 @@ export const fastApiErrorSchema = z.object({ detail: z.string() });
 export type Position = z.infer<typeof positionSchema>;
 export type Account = z.infer<typeof accountSchema>;
 export type Dashboard = z.infer<typeof dashboardSchema>;
+
+/** Show only the last four digits of an account number on screen. */
+export function maskAccount(id: string): string {
+  return `••${id.slice(-4)}`;
+}

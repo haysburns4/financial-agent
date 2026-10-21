@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
 
 from sqlalchemy import (
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -10,7 +11,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -182,6 +185,61 @@ class PipelineRun(Base):
     status: Mapped[str] = mapped_column(String(20))
     tickers_processed: Mapped[int] = mapped_column(default=0)
     errors: Mapped[str | None] = mapped_column(Text)
+
+
+class WatchlistItem(Base):
+    """A ticker the user chose to follow. Soft-deleted: `removed_at` set means
+    inactive, and re-adding restores the row with its note and tags. What is
+    monitored is this table's active rows plus held positions, computed on
+    demand by src/watchlist/resolver.py and never stored."""
+
+    __tablename__ = "watchlist"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(10))
+    note: Mapped[str | None] = mapped_column(Text)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list, server_default=text("'[]'"))
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Confirmed by a successful quote lookup.
+    validated: Mapped[bool] = mapped_column(default=False, server_default=false())
+    backfill_status: Mapped[str] = mapped_column(String(20))  # pending | running | done | failed
+    backfill_error: Mapped[str | None] = mapped_column(Text)
+    backfill_done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("ticker", name="uq_watchlist_ticker"),
+        CheckConstraint("ticker = upper(ticker)", name="ck_watchlist_ticker_upper"),
+        CheckConstraint(
+            "backfill_status IN ('pending', 'running', 'done', 'failed')", name="ck_watchlist_backfill_status"
+        ),
+    )
+
+
+class WatchlistEvent(Base):
+    """Every watchlist mutation, written in the same transaction as the change."""
+
+    __tablename__ = "watchlist_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(10), index=True)
+    event: Mapped[str] = mapped_column(String(20))  # added | removed | restored | note_changed | tags_changed
+    detail: Mapped[dict | None] = mapped_column(JSON)
+    source: Mapped[str] = mapped_column(String(20))  # ui | api
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event IN ('added', 'removed', 'restored', 'note_changed', 'tags_changed')",
+            name="ck_watchlist_events_event",
+        ),
+        CheckConstraint("source IN ('ui', 'api')", name="ck_watchlist_events_source"),
+    )
 
 
 class ETradeCredentials(Base):

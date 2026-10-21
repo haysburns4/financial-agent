@@ -12,7 +12,7 @@ from src.etrade.auth import auth
 from src.etrade.client import order_endpoints_blocked
 from src.llm import health as llm_health
 from src.portfolio_history import history_summary
-from src.scheduler import LLM_REPLY_TOKENS, build_scheduler, portfolio_history_pipeline
+from src.scheduler import LLM_REPLY_TOKENS, build_scheduler, portfolio_history_pipeline, watchlist_service
 from src.server import create_app
 
 
@@ -40,6 +40,11 @@ async def lifespan(app):
         )
     else:
         logger.info("No calibrated signal weights saved; using the defaults")
+
+    # Backfills a restart interrupted pick up where they left off.
+    resumed = await watchlist_service.resume_backfills()
+    if resumed:
+        logger.info("watchlist: backfilling {} in the background", ", ".join(resumed))
 
     scheduler = build_scheduler()
     scheduler.start()

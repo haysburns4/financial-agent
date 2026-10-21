@@ -1,7 +1,4 @@
-from typing import Annotated
-
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -44,9 +41,7 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "sqlite+aiosqlite:///data/agent.db"
 
-    WATCHLIST: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
-    )
+    WATCHLIST_MAX_SIZE: int = 50
 
     PRICE_POLL_MINUTES: int = 5
     PORTFOLIO_POLL_MINUTES: int = 15
@@ -63,13 +58,6 @@ class Settings(BaseSettings):
     # Loopback by default: the API has no auth of its own.
     API_HOST: str = "127.0.0.1"
     API_PORT: int = 8000
-
-    @field_validator("WATCHLIST", mode="before")
-    @classmethod
-    def _split_watchlist(cls, v):
-        if isinstance(v, str):
-            return [t.strip().upper() for t in v.split(",") if t.strip()]
-        return v
 
 
 settings = Settings()

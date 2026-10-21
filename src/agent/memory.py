@@ -1,8 +1,10 @@
 """Memory assembler: background context for a prompt, fitted to a token budget.
 
-Draws on the agent output archive and position snapshots, never on live data:
-chat reaches current positions and signals through its tools, and synthesis is
-handed its signals as input. This module only supplies what came before.
+Draws on the agent output archive and position snapshots, never on live market
+data: chat reaches current positions and signals through its tools, and
+synthesis is handed its signals as input. This module supplies what came
+before, plus the user's own watchlist notes and tags, which are intent rather
+than data ("waiting on earnings") and shape how a signal on that ticker reads.
 
 Two tasks:
 - chat: breadth. Earlier turns of the conversation, portfolio totals at a few
@@ -28,11 +30,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from src.agent.tools import mask_account
 from src.llm import estimate_tokens
 from src.models import AgentOutput, AgentOutputRef, PositionSnapshot
+from src.watchlist.resolver import MonitoredTicker, monitored_on
 
 MemoryTask = Literal["chat", "synthesis"]
-SectionLabel = Literal["portfolio", "conversation", "prior_narratives"]
+SectionLabel = Literal["watchlist", "portfolio", "conversation", "prior_narratives"]
 
 _TITLES: dict[SectionLabel, str] = {
+    "watchlist": "Monitored tickers (the user's watchlist and holdings, with their notes)",
     "portfolio": "Portfolio history",
     "conversation": "Earlier in this conversation",
     "prior_narratives": "Prior briefings",
@@ -149,6 +153,7 @@ async def build_context(
         async with engine.connect() as conn:
             candidates = [
                 _Candidate("conversation", await _conversation(conn, conversation_id, skip_recent_turns), True),
+                _Candidate("watchlist", _watchlist(await monitored_on(conn), None)),
                 _Candidate("portfolio", await _portfolio_totals(conn, account_id, lookback_days)),
                 _Candidate("prior_narratives", await _narratives(conn, narratives, _CHAT_NARRATIVE_CHARS)),
             ]
@@ -160,6 +165,7 @@ async def build_context(
         )
         async with engine.connect() as conn:
             candidates = [
+                _Candidate("watchlist", _watchlist(await monitored_on(conn), scope_tickers or [])),
                 _Candidate("portfolio", await _portfolio_detail(conn, scope_tickers or [])),
                 _Candidate("prior_narratives", await _narratives(conn, narratives, None)),
             ]
@@ -227,6 +233,28 @@ def _render(sections: list[ContextSection]) -> str:
 
 
 # ---------- sources ----------
+
+
+def _watchlist(monitored: list[MonitoredTicker], scope: list[str] | None) -> list[_Item]:
+    """One line per monitored ticker: why it is monitored, its tags and note."""
+    wanted = None if scope is None else {t.upper() for t in scope}
+    items: list[_Item] = []
+    for m in monitored:
+        if wanted is not None and m.ticker not in wanted:
+            continue
+        source = {"watchlist": "on watchlist", "held": "held", "both": "held, on watchlist"}[m.source]
+        line = f"- {m.ticker} ({source}"
+        if m.tags:
+            line += f"; tags: {', '.join(m.tags)}"
+        if not m.indicators_ready:
+            line += "; history still loading"
+        line += ")"
+        if m.note:
+            line += f" — user's note: {m.note}"
+        items.append(_Item(line))
+    # Annotated tickers first: if the budget runs short, bare tickers go first.
+    items.sort(key=lambda i: " — user's note: " not in i.text)
+    return items
 
 
 async def _conversation(conn: AsyncConnection, conversation_id: str | None, skip: int) -> list[_Item]:
