@@ -50,7 +50,8 @@ jobs:
       - name: Install
         run: npm ci
       - name: Typecheck
-        run: npx tsc --noEmit
+        # Generates the route type helpers (RouteContext) that tsc needs.
+        run: npm run typecheck
       - name: Anti-slop
         run: npm run lint:slop
       - name: Build
