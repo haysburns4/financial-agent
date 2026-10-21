@@ -104,6 +104,7 @@ def by_ticker(monitored: list[MonitoredTicker]) -> dict[str, MonitoredTicker]:
 async def test_resolver_labels_watchlist_held_and_both(engine):
     service = make_service(engine)
     await service.add("aapl", note="core", tags=["mega"])
+    await service.drain()
     await service.add("NVDA")
     await service.drain()
     await hold(engine, "NVDA")
@@ -237,6 +238,7 @@ async def test_badly_formed_tickers_are_rejected_before_any_lookup(engine, ticke
 async def test_share_classes_are_accepted(engine):
     service = make_service(engine)
     assert (await service.add("brk.b")).ticker == "BRK.B"
+    await service.drain()
     assert (await service.add("BF-B")).ticker == "BF-B"
     await service.drain()
 
@@ -244,6 +246,7 @@ async def test_share_classes_are_accepted(engine):
 async def test_the_cap_is_enforced(engine):
     service = make_service(engine, max_size=2)
     await service.add("AAPL")
+    await service.drain()
     await service.add("MSFT")
     await service.drain()
 
@@ -457,6 +460,7 @@ async def test_signal_engine_skips_entry_exit_until_indicators_are_ready_but_not
 async def test_build_context_carries_notes_for_chat_and_only_scoped_ones_for_synthesis(engine):
     service = make_service(engine)
     await service.add("NVDA", note="waiting on earnings", tags=["semis"])
+    await service.drain()
     await service.add("AAPL", note="trim above 250")
     await service.drain()
     await hold(engine, "V")
